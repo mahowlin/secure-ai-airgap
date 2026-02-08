@@ -1,0 +1,439 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+name: 'Sync Images'
+
+# Mirrors container images to local registry using parallel jobs
+# This is infrastructure-wide (same registry serves all clusters)
+#
+# Usage:
+#   gh workflow run "Sync Images"                           # All jobs (parallel)
+#   gh workflow run "Sync Images" -f sync_target=other-images  # Just other-images
+#   gh workflow run "Sync Images" -f sync_target=platform      # Just platform
+#   gh workflow run "Sync Images" -f sync_target=redhat-operators  # Just RH operators
+#
+# Architecture: 3 parallel oc-mirror jobs for ~3x speedup
+# - sync-platform: OCP release images (~11 min)
+# - sync-redhat-ops: redhat-operator-index (~16 min)
+# - sync-other: certified + tetragon + additionalImages (~13 min)
+# Total wall time: ~16-20 min (vs ~50 min sequential)
+
+on:
+  # Nightly schedule DISABLED - run manually when new images are needed
+  # schedule:
+  #   - cron: '0 1 * * *'
+
+  workflow_dispatch:
+    inputs:
+      sync_target:
+        description: 'What to sync (default: all)'
+        required: false
+        type: choice
+        options:
+          - all
+          - platform
+          - redhat-operators
+          - other-images
+        default: all
+
+  workflow_call:
+    secrets:
+      REDHAT_PULL_SECRET:
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  LOCAL_REGISTRY: ${{ vars.OCP_REGISTRY_URL }}
+
+jobs:
+  #----------------------------------------------------------------------------
+  # Job 1: Platform Images (OCP Release)
+  #----------------------------------------------------------------------------
+  sync-platform:
+    name: 'Platform Images'
+    if: ${{ inputs.sync_target == 'all' || inputs.sync_target == 'platform' || inputs.sync_target == '' }}
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure Registry Auth
+      run: |
+        mkdir -p ~/.docker
+        echo '${{ secrets.REDHAT_PULL_SECRET }}' > ~/.docker/config.json
+        chmod 600 ~/.docker/config.json
+
+    - name: Mirror Platform Images
+      working-directory: mirror
+      shell: bash
+      run: |
+        set -o pipefail
+        echo "Mirroring platform images to $LOCAL_REGISTRY..."
+        oc-mirror --v2 --config platform-images.yaml \
+          docker://$LOCAL_REGISTRY \
+          --workspace file://$GITHUB_WORKSPACE/oc-mirror-workspace \
+          --dest-tls-verify=false \
+          --parallel-images 2 \
+          --parallel-layers 3 \
+          --retry-times 3 \
+          --image-timeout 120m 2>&1 | tee mirror.log
+
+        if grep -q '\[ERROR\]' mirror.log; then
+          echo "::error::oc-mirror reported errors"
+          grep '\[ERROR\]' mirror.log
+          exit 1
+        fi
+
+    - name: Upload IDMS Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: idms-platform
+        path: oc-mirror-workspace/working-dir/cluster-resources/*.yaml
+        if-no-files-found: ignore
+
+  #----------------------------------------------------------------------------
+  # Job 2: Red Hat Operators (heaviest catalog)
+  #----------------------------------------------------------------------------
+  sync-redhat-ops:
+    name: 'Red Hat Operators'
+    if: ${{ inputs.sync_target == 'all' || inputs.sync_target == 'redhat-operators' || inputs.sync_target == '' }}
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure Registry Auth
+      run: |
+        mkdir -p ~/.docker
+        echo '${{ secrets.REDHAT_PULL_SECRET }}' > ~/.docker/config.json
+        chmod 600 ~/.docker/config.json
+
+    - name: Mirror Red Hat Operators
+      working-directory: mirror
+      shell: bash
+      run: |
+        set -o pipefail
+        echo "Mirroring Red Hat operators to $LOCAL_REGISTRY..."
+        oc-mirror --v2 --config redhat-operators.yaml \
+          docker://$LOCAL_REGISTRY \
+          --workspace file://$GITHUB_WORKSPACE/oc-mirror-workspace \
+          --dest-tls-verify=false \
+          --parallel-images 2 \
+          --parallel-layers 3 \
+          --retry-times 3 \
+          --image-timeout 120m 2>&1 | tee mirror.log
+
+        if grep -q '\[ERROR\]' mirror.log; then
+          echo "::error::oc-mirror reported errors"
+          grep '\[ERROR\]' mirror.log
+          exit 1
+        fi
+
+    - name: Upload IDMS Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: idms-redhat-ops
+        path: oc-mirror-workspace/working-dir/cluster-resources/*.yaml
+        if-no-files-found: ignore
+
+  #----------------------------------------------------------------------------
+  # Job 3: Certified/Tetragon Operators + Additional Images
+  #----------------------------------------------------------------------------
+  sync-other:
+    name: 'Other Images'
+    if: ${{ inputs.sync_target == 'all' || inputs.sync_target == 'other-images' || inputs.sync_target == '' }}
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+
+    env:
+      NVIDIA_NGC_API_KEY: ${{ secrets.NVIDIA_NGC_API_KEY }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure Registry Auth
+      run: |
+        mkdir -p ~/.docker
+        echo '${{ secrets.REDHAT_PULL_SECRET }}' > ~/.docker/config.json
+
+        # Add NVIDIA NGC registry auth if API key is provided
+        if [ -n "$NVIDIA_NGC_API_KEY" ]; then
+          echo "Adding NVIDIA NGC registry authentication..."
+          NVIDIA_AUTH=$(echo -n '$oauthtoken:'"$NVIDIA_NGC_API_KEY" | base64 -w 0)
+          jq --arg auth "$NVIDIA_AUTH" \
+            '.auths["nvcr.io"] = {"auth": $auth}' \
+            ~/.docker/config.json > ~/.docker/config.json.tmp
+          mv ~/.docker/config.json.tmp ~/.docker/config.json
+        fi
+
+        chmod 600 ~/.docker/config.json
+
+    - name: Mirror Other Images
+      working-directory: mirror
+      shell: bash
+      run: |
+        set -o pipefail
+        echo "Mirroring other images to $LOCAL_REGISTRY..."
+        oc-mirror --v2 --config other-images.yaml \
+          docker://$LOCAL_REGISTRY \
+          --workspace file://$GITHUB_WORKSPACE/oc-mirror-workspace \
+          --dest-tls-verify=false \
+          --parallel-images 2 \
+          --parallel-layers 3 \
+          --retry-times 3 \
+          --image-timeout 120m 2>&1 | tee mirror.log
+
+        if grep -q '\[ERROR\]' mirror.log; then
+          echo "::error::oc-mirror reported errors"
+          grep '\[ERROR\]' mirror.log
+          exit 1
+        fi
+
+    - name: Generate Custom IDMS
+      run: |
+        # Generate IDMS for images that oc-mirror doesn't cover
+        # oc-mirror only generates IDMS for registry.redhat.io sources
+        mkdir -p oc-mirror-workspace/working-dir/cluster-resources
+
+        # NVIDIA images from docker.io, nvcr.io, and registry.connect.redhat.com
+        cat > oc-mirror-workspace/working-dir/cluster-resources/idms-nvidia.yaml << 'EOF'
+        apiVersion: config.openshift.io/v1
+        kind: ImageDigestMirrorSet
+        metadata:
+          name: nvidia-images
+          annotations:
+            createdBy: sync-images workflow
+        spec:
+          imageDigestMirrors:
+            - mirrors:
+                - registry.example.com:5000/nvidia
+              source: docker.io/nvidia
+            - mirrors:
+                - registry.example.com:5000/nvidia
+              source: nvcr.io/nvidia
+            - mirrors:
+                - registry.example.com:5000/nvidia
+              source: registry.connect.redhat.com/nvidia
+        EOF
+        echo "Generated NVIDIA IDMS"
+
+        # Isovalent images from quay.io
+        cat > oc-mirror-workspace/working-dir/cluster-resources/idms-isovalent.yaml << 'EOF'
+        apiVersion: config.openshift.io/v1
+        kind: ImageDigestMirrorSet
+        metadata:
+          name: isovalent-images
+          annotations:
+            createdBy: sync-images workflow
+        spec:
+          imageDigestMirrors:
+            - mirrors:
+                - registry.example.com:5000/isovalent
+              source: quay.io/isovalent
+        EOF
+        echo "Generated Isovalent IDMS"
+
+        # OpenShift 4 images from registry.redhat.io
+        # oc-mirror generates openshift4 in ITMS (tag-based) but not IDMS (digest-based)
+        # OLM pulls operator images by digest for security, so IDMS is required
+        cat > oc-mirror-workspace/working-dir/cluster-resources/idms-openshift4.yaml << 'EOF'
+        apiVersion: config.openshift.io/v1
+        kind: ImageDigestMirrorSet
+        metadata:
+          name: openshift4-images
+          annotations:
+            createdBy: sync-images workflow
+        spec:
+          imageDigestMirrors:
+            - mirrors:
+                - registry.example.com:5000/openshift4
+              source: registry.redhat.io/openshift4
+        EOF
+        echo "Generated OpenShift4 IDMS"
+
+    - name: Upload IDMS Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: idms-other
+        path: oc-mirror-workspace/working-dir/cluster-resources/*.yaml
+        if-no-files-found: ignore
+
+  #----------------------------------------------------------------------------
+  # Combine: Merge all IDMS artifacts and commit to repo
+  #----------------------------------------------------------------------------
+  combine-idms:
+    name: 'Combine IDMS'
+    runs-on: [self-hosted, linux, saif-github-runner]
+    needs: [sync-platform, sync-redhat-ops, sync-other]
+    if: always()
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.ref }}
+
+    - name: Download All Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: idms-download
+        pattern: idms-*
+        merge-multiple: true
+
+    - name: Update IDMS in Repository
+      run: |
+        echo "## Combined IDMS Manifests" >> $GITHUB_STEP_SUMMARY
+
+        # Create generated IDMS directory
+        mkdir -p mirror/idms
+
+        # Copy downloaded IDMS files to repo (preserving existing static IDMS)
+        if ls idms-download/*.yaml 1>/dev/null 2>&1; then
+          cp idms-download/*.yaml mirror/idms/
+          echo "Copied IDMS files to mirror/idms/" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -la mirror/idms/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ No IDMS files found in artifacts" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Commit IDMS to Repository
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        git add mirror/idms/
+
+        if git diff --staged --quiet; then
+          echo "ℹ️ No IDMS changes to commit" >> $GITHUB_STEP_SUMMARY
+        else
+          git commit -m "Update IDMS manifests from sync-images run ${{ github.run_id }}"
+
+          # Retry push with rebase if race condition
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            if git push; then
+              echo "✅ IDMS committed to repository" >> $GITHUB_STEP_SUMMARY
+              break
+            else
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "Push failed (attempt $i/$MAX_RETRIES), rebasing..."
+                git pull --rebase
+              else
+                echo "❌ Failed to push after $MAX_RETRIES attempts" >> $GITHUB_STEP_SUMMARY
+                exit 1
+              fi
+            fi
+          done
+        fi
+
+    - name: Upload Combined IDMS (backup artifact)
+      uses: actions/upload-artifact@v4
+      with:
+        name: idms-manifests
+        path: mirror/idms/*.yaml
+        if-no-files-found: warn
+
+  #----------------------------------------------------------------------------
+  # Package IDMS as OCI Helm Chart
+  #----------------------------------------------------------------------------
+  package-oci:
+    name: 'Package OCI Chart'
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+    needs: [combine-idms]
+    if: needs.combine-idms.result == 'success'
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.ref }}
+
+    - name: Pull Latest (get IDMS from combine-idms commit)
+      run: |
+        git pull origin ${{ github.ref_name }}
+
+    - name: Prepare Chart
+      run: |
+        # Copy IDMS/ITMS files to chart templates (exclude CatalogSources)
+        echo "Copying IDMS/ITMS to chart templates..."
+        for file in mirror/idms/idms-*.yaml mirror/idms/itms-*.yaml; do
+          if [ -f "$file" ]; then
+            cp "$file" charts/platform-idms/templates/
+            echo "  Copied: $(basename $file)"
+          fi
+        done
+
+        # Update Chart.yaml with version
+        # SemVer format: MAJOR.MINOR.PATCH-prerelease
+        # Prerelease includes OCP version and commit hash for traceability
+        VERSION="1.0.0-ocp4.19.$(git rev-parse --short HEAD)"
+        echo "Setting chart version: $VERSION"
+        sed -i "s/^version:.*/version: $VERSION/" charts/platform-idms/Chart.yaml
+
+        echo "Chart contents:"
+        ls -la charts/platform-idms/templates/
+
+    - name: Package and Push to OCI Registry
+      run: |
+        echo "Packaging Helm chart..."
+        helm package charts/platform-idms -d /tmp/
+
+        CHART_FILE=$(ls /tmp/platform-idms-*.tgz)
+        echo "Chart package: $CHART_FILE"
+
+        echo "Pushing to OCI registry..."
+        helm push "$CHART_FILE" oci://$LOCAL_REGISTRY/charts --insecure-skip-tls-verify
+
+        echo "## OCI Chart Published" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        VERSION=$(helm show chart charts/platform-idms | grep '^version:' | awk '{print $2}')
+        echo "**Chart:** \`oci://$LOCAL_REGISTRY/charts/platform-idms:$VERSION\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**ArgoCD Application source:**" >> $GITHUB_STEP_SUMMARY
+        echo '```yaml' >> $GITHUB_STEP_SUMMARY
+        echo "source:" >> $GITHUB_STEP_SUMMARY
+        echo "  repoURL: oci://$LOCAL_REGISTRY/charts" >> $GITHUB_STEP_SUMMARY
+        echo "  chart: platform-idms" >> $GITHUB_STEP_SUMMARY
+        echo "  targetRevision: \"$VERSION\"" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+  #----------------------------------------------------------------------------
+  # Summary
+  #----------------------------------------------------------------------------
+  summary:
+    name: 'Summary'
+    runs-on: [self-hosted, linux, saif-github-runner]
+    needs: [sync-platform, sync-redhat-ops, sync-other, combine-idms, package-oci]
+    if: always()
+
+    steps:
+    - name: Generate Summary
+      run: |
+        echo "## Image Sync Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Registry:** ${{ vars.OCP_REGISTRY_URL }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Job Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Platform Images | ${{ needs.sync-platform.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Red Hat Operators | ${{ needs.sync-redhat-ops.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Other Images | ${{ needs.sync-other.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Combine IDMS | ${{ needs.combine-idms.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Package OCI | ${{ needs.package-oci.result }} |" >> $GITHUB_STEP_SUMMARY

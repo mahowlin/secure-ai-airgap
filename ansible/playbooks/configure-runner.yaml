@@ -1,0 +1,647 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+---
+# Ansible Playbook: Configure Runner VM (Ubuntu 24.04)
+# Purpose: Install and configure GitHub Actions DinD runners, container registry, and web server
+#
+# Prerequisites:
+#   ansible-galaxy collection install -r requirements.yml
+#
+# Usage:
+#   RUNNER_TOKEN=$(gh api -X POST /orgs/mahowlin/actions/runners/registration-token --jq '.token')
+#   ansible-playbook -i ../environments/example/hosts.ini configure-runner.yaml \
+#     --extra-vars "runner_token=${RUNNER_TOKEN}"
+
+- name: Configure Runner VM for AI Pod Deployment
+  hosts: runner
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../../environments/{{ env | default('example') }}/group_vars.yml"
+
+  handlers:
+    - name: Restart nginx container
+      community.docker.docker_container:
+        name: webserver-1
+        state: started
+        restart: true
+
+  tasks:
+    #--------------------------------------------------------------------------
+    # System Preparation (Ubuntu 24.04)
+    #--------------------------------------------------------------------------
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      tags: [system]
+
+    - name: Upgrade system packages
+      ansible.builtin.apt:
+        upgrade: dist
+      tags: [system]
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - git
+          - wget
+          - unzip
+          - jq
+          - python3-pip
+          - ufw
+          - xfsprogs
+        state: present
+      tags: [system]
+
+    - name: Enable and configure UFW
+      community.general.ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+      tags: [system]
+
+    - name: Allow SSH through UFW
+      community.general.ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+      tags: [system]
+
+    #--------------------------------------------------------------------------
+    # Docker CE Installation
+    #--------------------------------------------------------------------------
+
+    - name: Create keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+      tags: [docker]
+
+    - name: Add Docker GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+      tags: [docker]
+
+    - name: Add Docker repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+      tags: [docker]
+
+    - name: Install Docker CE
+      ansible.builtin.apt:
+        name:
+          - "docker-ce={{ docker_version }}"
+          - "docker-ce-cli={{ docker_version }}"
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+      tags: [docker]
+
+    - name: Start and enable Docker service
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+      tags: [docker]
+
+    #--------------------------------------------------------------------------
+    # Data Disk Setup
+    #--------------------------------------------------------------------------
+
+    - name: Check if data disk is already formatted
+      ansible.builtin.command: blkid {{ data_disk_device }}
+      register: blkid_result
+      changed_when: false
+      failed_when: false
+      tags: [storage]
+
+    - name: Format data disk with XFS
+      ansible.builtin.filesystem:
+        fstype: xfs
+        dev: "{{ data_disk_device }}"
+      when: blkid_result.rc != 0
+      tags: [storage]
+
+    - name: Create data mount point
+      ansible.builtin.file:
+        path: "{{ data_mount_point }}"
+        state: directory
+        mode: "0755"
+      tags: [storage]
+
+    - name: Mount data disk
+      ansible.posix.mount:
+        path: "{{ data_mount_point }}"
+        src: "{{ data_disk_device }}"
+        fstype: xfs
+        opts: defaults
+        state: mounted
+      tags: [storage]
+
+    - name: Create registry data directory
+      ansible.builtin.file:
+        path: "{{ registry_data_dir }}"
+        state: directory
+        mode: "0755"
+      tags: [storage]
+
+    - name: Create web server data directory
+      ansible.builtin.file:
+        path: "{{ webserver_data_dir }}"
+        state: directory
+        mode: "0777"
+        owner: "101"
+        group: "101"
+      tags: [storage, webserver]
+
+    - name: Create terraform state data directory
+      ansible.builtin.file:
+        path: "{{ tfstate_data_dir }}"
+        state: directory
+        mode: "0755"
+      tags: [storage]
+
+    #--------------------------------------------------------------------------
+    # Container Registry Setup
+    #--------------------------------------------------------------------------
+
+    - name: Open UFW port for registry
+      community.general.ufw:
+        rule: allow
+        port: "{{ registry_port }}"
+        proto: tcp
+      tags: [registry]
+
+    - name: Pull registry image
+      community.docker.docker_image:
+        name: registry
+        tag: "{{ registry_image_tag }}"
+        source: pull
+        force_source: false
+      tags: [registry]
+
+    # Registry TLS Certificate
+    - name: Create registry certificate directory
+      ansible.builtin.file:
+        path: "{{ data_mount_point }}/certs"
+        state: directory
+        mode: '0755'
+      tags: [registry, certs]
+
+    - name: Check if registry certificate exists
+      ansible.builtin.stat:
+        path: "{{ data_mount_point }}/certs/registry.crt"
+      register: registry_cert
+      tags: [registry, certs]
+
+    - name: Generate registry TLS certificate
+      ansible.builtin.shell: |
+        openssl req -newkey rsa:4096 -nodes -sha256 \
+          -keyout {{ data_mount_point }}/certs/registry.key \
+          -x509 -days 3650 \
+          -out {{ data_mount_point }}/certs/registry.crt \
+          -subj "/CN=registry.example.com" \
+          -addext "subjectAltName=DNS:registry.example.com,IP:{{ ansible_host }}"
+      when: not registry_cert.stat.exists
+      tags: [registry, certs]
+
+    - name: Set registry certificate permissions
+      ansible.builtin.file:
+        path: "{{ data_mount_point }}/certs/{{ item.name }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { name: 'registry.crt', mode: '0644' }
+        - { name: 'registry.key', mode: '0600' }
+      when: not registry_cert.stat.exists
+      tags: [registry, certs]
+
+    - name: Create and start registry container
+      community.docker.docker_container:
+        name: registry
+        image: "registry:{{ registry_image_tag }}"
+        state: started
+        restart_policy: always
+        ports:
+          - "{{ registry_port }}:5000"
+        volumes:
+          - "{{ registry_data_dir }}:/var/lib/registry"
+          - "{{ data_mount_point }}/certs:/certs:ro"
+        env:
+          REGISTRY_HTTP_TLS_CERTIFICATE: "/certs/registry.crt"
+          REGISTRY_HTTP_TLS_KEY: "/certs/registry.key"
+      tags: [registry]
+
+    #--------------------------------------------------------------------------
+    # Web Server Setup (nginx with WebDAV + Basic Auth)
+    #--------------------------------------------------------------------------
+
+    - name: Open UFW port for web server
+      community.general.ufw:
+        rule: allow
+        port: "{{ webserver_port }}"
+        proto: tcp
+      tags: [webserver]
+
+    - name: Install packages for htpasswd
+      ansible.builtin.apt:
+        name:
+          - apache2-utils
+          - python3-passlib
+        state: present
+      tags: [webserver]
+
+    - name: Create htpasswd file for nginx
+      community.general.htpasswd:
+        path: "{{ data_mount_point }}/.htpasswd"
+        name: "{{ http_auth_user }}"
+        password: "{{ http_auth_password }}"
+        mode: "0644"
+      when: http_auth_password is defined
+      tags: [webserver]
+
+    - name: Pull nginx image
+      community.docker.docker_image:
+        name: nginx
+        tag: "{{ nginx_image_tag }}"
+        source: pull
+        force_source: false
+      tags: [webserver]
+
+    - name: Create nginx config with WebDAV and basic auth
+      ansible.builtin.copy:
+        dest: "{{ data_mount_point }}/nginx.conf"
+        mode: "0644"
+        content: |
+          server {
+              listen       80;
+              listen  [::]:80;
+              server_name  localhost;
+
+              # Basic auth for all requests
+              auth_basic "SAIF Platform Services";
+              auth_basic_user_file /etc/nginx/.htpasswd;
+
+              # WebDAV file server for ISOs
+              root /data/images;
+
+              location / {
+                  dav_methods PUT DELETE MKCOL;
+                  dav_access user:rw group:rw all:r;
+                  create_full_put_path on;
+                  client_max_body_size 10G;
+                  autoindex on;
+                  autoindex_exact_size off;
+                  autoindex_localtime on;
+              }
+
+              error_page   500 502 503 504  /50x.html;
+              location = /50x.html {
+                  root   /usr/share/nginx/html;
+              }
+          }
+      tags: [webserver]
+      notify: Restart nginx container
+
+    - name: Create and start nginx container
+      community.docker.docker_container:
+        name: webserver-1
+        image: "nginx:{{ nginx_image_tag }}"
+        state: started
+        restart_policy: always
+        ports:
+          - "{{ webserver_port }}:80"
+        volumes:
+          - "{{ webserver_data_dir }}:/data/images"
+          - "{{ data_mount_point }}/nginx.conf:/etc/nginx/conf.d/default.conf:ro"
+          - "{{ data_mount_point }}/.htpasswd:/etc/nginx/.htpasswd:ro"
+      tags: [webserver]
+
+    #--------------------------------------------------------------------------
+    # Terraform State Backend Setup
+    #--------------------------------------------------------------------------
+
+    - name: Open UFW port for terraform state backend
+      community.general.ufw:
+        rule: allow
+        port: "{{ tfstate_port }}"
+        proto: tcp
+      tags: [tfstate]
+
+    - name: Pull terraform-backend image
+      community.docker.docker_image:
+        name: "{{ tfstate_image }}"
+        tag: "{{ tfstate_image_tag }}"
+        source: pull
+        force_source: false
+      tags: [tfstate]
+
+    - name: Generate KMS key for terraform-backend if not exists
+      ansible.builtin.shell: |
+        if [ ! -f {{ data_mount_point }}/.tfstate_kms_key ]; then
+          openssl rand -base64 32 > {{ data_mount_point }}/.tfstate_kms_key
+          chmod 600 {{ data_mount_point }}/.tfstate_kms_key
+        fi
+        cat {{ data_mount_point }}/.tfstate_kms_key
+      register: kms_key_result
+      changed_when: false
+      tags: [tfstate]
+
+    - name: Create and start terraform-backend container
+      community.docker.docker_container:
+        name: terraform-backend
+        image: "{{ tfstate_image }}:{{ tfstate_image_tag }}"
+        state: started
+        restart_policy: always
+        ports:
+          - "{{ tfstate_port }}:8080"
+        volumes:
+          - "{{ tfstate_data_dir }}:/states"
+        env:
+          STORAGE: local
+          STORAGE_LOCAL_DIR: /states
+          LOCK: local
+          AUTH_BASIC_ENABLED: "true"
+          KMS_KEY: "{{ kms_key_result.stdout | trim }}"
+      tags: [tfstate]
+
+    #--------------------------------------------------------------------------
+    # Gitea - Internal Git Server for GitOps
+    #--------------------------------------------------------------------------
+
+    - name: Open UFW port for Gitea HTTP
+      community.general.ufw:
+        rule: allow
+        port: "{{ gitea_http_port }}"
+        proto: tcp
+      tags: [gitea]
+
+    - name: Open UFW port for Gitea SSH
+      community.general.ufw:
+        rule: allow
+        port: "{{ gitea_ssh_port }}"
+        proto: tcp
+      tags: [gitea]
+
+    - name: Create Gitea data directory
+      ansible.builtin.file:
+        path: "{{ gitea_data_dir }}"
+        state: directory
+        mode: '0755'
+      tags: [gitea]
+
+    - name: Pull Gitea image
+      community.docker.docker_image:
+        name: gitea/gitea
+        tag: "{{ gitea_version }}"
+        source: pull
+        force_source: false
+      tags: [gitea]
+
+    - name: Start Gitea container
+      community.docker.docker_container:
+        name: gitea
+        image: "gitea/gitea:{{ gitea_version }}"
+        state: started
+        restart_policy: unless-stopped
+        ports:
+          - "{{ gitea_http_port }}:3000"
+          - "{{ gitea_ssh_port }}:22"
+        volumes:
+          - "{{ gitea_data_dir }}:/data"
+          - /etc/timezone:/etc/timezone:ro
+          - /etc/localtime:/etc/localtime:ro
+        env:
+          USER_UID: "1000"
+          USER_GID: "1000"
+          # Server configuration
+          GITEA__server__DOMAIN: "{{ gitea_domain }}"
+          GITEA__server__ROOT_URL: "{{ gitea_root_url }}"
+          GITEA__server__SSH_DOMAIN: "{{ gitea_domain }}"
+          GITEA__server__SSH_PORT: "{{ gitea_ssh_port }}"
+          # Database configuration (SQLite)
+          GITEA__database__DB_TYPE: "sqlite3"
+          GITEA__database__PATH: "/data/gitea/gitea.db"
+          # Skip web installer - configure programmatically
+          GITEA__security__INSTALL_LOCK: "true"
+          # Disable registration (admin-only user creation)
+          GITEA__service__DISABLE_REGISTRATION: "true"
+      tags: [gitea]
+
+    - name: Wait for Gitea to be ready
+      ansible.builtin.uri:
+        url: "http://localhost:{{ gitea_http_port }}/api/v1/version"
+        method: GET
+        status_code: [200]
+      register: gitea_health
+      until: gitea_health.status == 200
+      retries: 30
+      delay: 2
+      tags: [gitea]
+
+    - name: Check if Gitea admin user exists
+      ansible.builtin.command:
+        cmd: docker exec -u git gitea gitea admin user list --admin
+      register: gitea_admin_check
+      changed_when: false
+      failed_when: false
+      tags: [gitea]
+
+    - name: Create Gitea admin user
+      ansible.builtin.shell:
+        cmd: |
+          docker exec -u git gitea gitea admin user create \
+            --username '{{ gitea_admin_user }}' \
+            --password '{{ gitea_admin_password }}' \
+            --email '{{ gitea_admin_email }}' \
+            --admin \
+            --must-change-password=false
+      when:
+        - gitea_admin_password is defined
+        - gitea_admin_user not in gitea_admin_check.stdout
+      tags: [gitea]
+
+    - name: Check if Gitea organization exists
+      ansible.builtin.uri:
+        url: "http://localhost:{{ gitea_http_port }}/api/v1/orgs/{{ gitea_org_name }}"
+        method: GET
+        status_code: [200, 404]
+        user: "{{ gitea_admin_user }}"
+        password: "{{ gitea_admin_password }}"
+        force_basic_auth: true
+      register: gitea_org_check
+      when: gitea_admin_password is defined
+      tags: [gitea]
+
+    - name: Create Gitea organization
+      ansible.builtin.uri:
+        url: "http://localhost:{{ gitea_http_port }}/api/v1/orgs"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ gitea_org_name }}"
+          visibility: "private"
+        status_code: [201]
+        user: "{{ gitea_admin_user }}"
+        password: "{{ gitea_admin_password }}"
+        force_basic_auth: true
+      when:
+        - gitea_admin_password is defined
+        - gitea_org_check.status == 404
+      tags: [gitea]
+
+    - name: Check if Gitea repository exists
+      ansible.builtin.uri:
+        url: "http://localhost:{{ gitea_http_port }}/api/v1/repos/{{ gitea_org_name }}/{{ gitea_repo_name }}"
+        method: GET
+        status_code: [200, 404]
+        user: "{{ gitea_admin_user }}"
+        password: "{{ gitea_admin_password }}"
+        force_basic_auth: true
+      register: gitea_repo_check
+      when: gitea_admin_password is defined
+      tags: [gitea]
+
+    - name: Create Gitea repository
+      ansible.builtin.uri:
+        url: "http://localhost:{{ gitea_http_port }}/api/v1/orgs/{{ gitea_org_name }}/repos"
+        method: POST
+        body_format: json
+        body:
+          name: "{{ gitea_repo_name }}"
+          description: "GitOps applications for ArgoCD"
+          private: true
+          auto_init: true
+        status_code: [201]
+        user: "{{ gitea_admin_user }}"
+        password: "{{ gitea_admin_password }}"
+        force_basic_auth: true
+      when:
+        - gitea_admin_password is defined
+        - gitea_repo_check.status == 404
+      tags: [gitea]
+
+    #--------------------------------------------------------------------------
+    # GitHub Actions Runner Containers (DinD)
+    #--------------------------------------------------------------------------
+
+    - name: Create runner workspace directories
+      ansible.builtin.file:
+        path: "{{ data_mount_point }}/runner-{{ item }}"
+        state: directory
+        owner: 1000
+        group: 1000
+        mode: "0755"
+      loop: "{{ range(1, runner_count + 1) | list }}"
+      tags: [runner]
+
+    - name: Create shared externals directory
+      ansible.builtin.file:
+        path: "{{ data_mount_point }}/externals"
+        state: directory
+        owner: 1000
+        group: 1000
+        mode: "0755"
+      tags: [runner]
+
+    - name: Pull GitHub Actions runner image
+      community.docker.docker_image:
+        name: myoung34/github-runner
+        tag: "{{ runner_image_tag }}"
+        source: pull
+        force_source: false
+      tags: [runner]
+
+    - name: Check if externals already copied
+      ansible.builtin.stat:
+        path: "{{ data_mount_point }}/externals/node20"
+      register: externals_check
+      tags: [runner]
+
+    - name: Copy externals from runner image to host (for DinD job containers)
+      ansible.builtin.shell: |
+        docker run --rm --entrypoint /bin/cp \
+          -v {{ data_mount_point }}/externals:/target \
+          myoung34/github-runner:{{ runner_image_tag }} \
+          -r /actions-runner/externals/. /target/
+      when: not externals_check.stat.exists
+      tags: [runner]
+
+    - name: Create /actions-runner directory on host
+      ansible.builtin.file:
+        path: /actions-runner
+        state: directory
+        mode: "0755"
+      tags: [runner]
+
+    - name: Create externals symlink for DinD job containers
+      ansible.builtin.file:
+        src: "{{ data_mount_point }}/externals"
+        dest: /actions-runner/externals
+        state: link
+      tags: [runner]
+
+    - name: Deploy runner containers
+      community.docker.docker_container:
+        name: "runner-{{ item }}"
+        image: "myoung34/github-runner:{{ runner_image_tag }}"
+        state: started
+        restart_policy: always
+        env:
+          RUNNER_NAME: "saif-runner-{{ item }}"
+          RUNNER_SCOPE: "org"
+          ORG_NAME: "{{ github_org }}"
+          LABELS: "{{ github_runner_labels }}"
+          RUNNER_TOKEN: "{{ runner_token }}"
+          RUNNER_WORKDIR: "{{ data_mount_point }}/runner-{{ item }}"
+          # Disable auto-updates: runner self-updates fail in Docker containers
+          # causing restart loops. Updates are controlled via image tag instead.
+          DISABLE_AUTO_UPDATE: "true"
+        volumes:
+          - "/var/run/docker.sock:/var/run/docker.sock"
+          - "{{ data_mount_point }}/runner-{{ item }}:{{ data_mount_point }}/runner-{{ item }}"
+      loop: "{{ range(1, runner_count + 1) | list }}"
+      tags: [runner]
+
+    #--------------------------------------------------------------------------
+    # Final Status
+    #--------------------------------------------------------------------------
+
+    - name: Display final configuration summary
+      ansible.builtin.debug:
+        msg: |
+          Runner VM Configuration Complete!
+
+          Services:
+          - Container Registry:   https://{{ ansible_fqdn }}:{{ registry_port }} (TLS enabled)
+          - Web Server (WebDAV):  http://{{ ansible_fqdn }}:{{ webserver_port }} (auth: {{ http_auth_user }})
+          - Terraform State:      http://{{ ansible_fqdn }}:{{ tfstate_port }} (auth: {{ http_auth_user }})
+
+          Storage:
+          - Data disk mounted at: {{ data_mount_point }}
+          - Registry data:        {{ registry_data_dir }}
+          - ISO/Images:           {{ webserver_data_dir }}
+          - Terraform state:      {{ tfstate_data_dir }}
+
+          Runtime:
+          - Docker CE
+
+          GitHub Actions Runners:
+          - {{ runner_count }} DinD runners deployed (runner-1 to runner-{{ runner_count }})
+          - Image: myoung34/github-runner:{{ runner_image_tag }}
+          - Labels: {{ github_runner_labels }}
+
+          Note: CI/CD tools (Terraform, oc, kubectl, etc.) are provided via
+          the github-actions-container image used in workflow container: directive.

@@ -1,0 +1,21 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+#------------------------------------------------------------------------------
+# Platform Images - OpenShift Release Images Only
+#------------------------------------------------------------------------------
+# Split config for parallel mirroring. See images-list.yaml for full config.
+# Estimated time: ~11 min
+#------------------------------------------------------------------------------
+
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  platform:
+    channels:
+      - name: stable-4.19
+        minVersion: 4.19.21
+        maxVersion: 4.19.21
+        type: ocp
+    graph: true

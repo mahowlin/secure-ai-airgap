@@ -1,0 +1,78 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+---
+# SAIF environment group variables
+# Used by ansible/playbooks/configure-runner.yaml
+
+# =============================================================================
+# Storage Configuration
+# =============================================================================
+data_disk_device: /dev/sdb
+data_mount_point: /data
+
+# =============================================================================
+# Docker Configuration
+# =============================================================================
+docker_version: "5:29.1.3-1~ubuntu.24.04~noble"
+
+# =============================================================================
+# Container Registry Configuration
+# =============================================================================
+registry_port: "5000"
+registry_data_dir: "{{ data_mount_point }}/registry"
+registry_image_tag: "2.8.3"
+
+# =============================================================================
+# Web Server Configuration (nginx with WebDAV)
+# =============================================================================
+webserver_port: "80"
+webserver_data_dir: "{{ data_mount_point }}/images"
+nginx_image_tag: "1.27.3-alpine"
+
+# =============================================================================
+# Terraform State Backend Configuration
+# =============================================================================
+tfstate_port: "8081"
+tfstate_data_dir: "{{ data_mount_point }}/tfstate"
+tfstate_image: "ghcr.io/nimbolus/terraform-backend"
+tfstate_image_tag: "latest"
+
+# =============================================================================
+# HTTP Authentication (shared by nginx and terraform-backend)
+# =============================================================================
+http_auth_user: "admin"
+# http_auth_password: Set via --extra-vars at runtime or Ansible Vault
+
+# =============================================================================
+# Gitea Configuration (Internal Git Server for GitOps)
+# =============================================================================
+gitea_version: "1.22"
+gitea_http_port: "3000"
+gitea_ssh_port: "2222"
+gitea_data_dir: "{{ data_mount_point }}/gitea"
+gitea_domain: "gitea.example.com"
+gitea_root_url: "http://gitea.example.com:3000"
+gitea_admin_user: "admin"
+gitea_admin_email: "admin@example.com"
+# gitea_admin_password: Set via --extra-vars at runtime or Ansible Vault
+gitea_org_name: "mahowlin"
+gitea_repo_name: "saif-gitops"
+
+# =============================================================================
+# GitHub Actions Runner Configuration (DinD)
+# =============================================================================
+runner_count: 3
+runner_image_tag: "latest"
+github_org: "mahowlin"
+github_runner_labels: "self-hosted,linux,saif-github-runner"
+# runner_token: Set via --extra-vars at runtime
+#   RUNNER_TOKEN=$(gh api -X POST /orgs/mahowlin/actions/runners/registration-token --jq '.token')
+
+# =============================================================================
+# Notes
+# =============================================================================
+# CI/CD tools (Terraform, oc, kubectl, etc.) are provided via the
+# github-actions-container image used in workflow container: directive,
+# not installed on the runner VM.

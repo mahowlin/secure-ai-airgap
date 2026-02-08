@@ -1,0 +1,14 @@
+# Platform IDMS/ITMS Helm Chart
+# Packaged and pushed to OCI registry by sync-images workflow
+#
+# Contains ImageDigestMirrorSet and ImageTagMirrorSet resources
+# for disconnected OpenShift clusters to pull from internal registry.
+#
+# Version is updated dynamically by sync-images workflow:
+#   saif-1.0.0-ocp4.19-<commit>
+apiVersion: v2
+name: platform-idms
+description: Platform IDMS/ITMS manifests for disconnected registry access
+type: application
+version: 0.0.0-placeholder
+appVersion: "4.19"

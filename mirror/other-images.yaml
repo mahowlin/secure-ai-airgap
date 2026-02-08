@@ -1,0 +1,83 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+#------------------------------------------------------------------------------
+# Other Images - Certified/Tetragon Operators + Additional Images
+#------------------------------------------------------------------------------
+# Split config for parallel mirroring. See images-list.yaml for full config.
+# Estimated time: ~13 min
+#------------------------------------------------------------------------------
+
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  operators:
+    # Certified Operators (from certified-operator-index)
+    - catalog: registry.redhat.io/redhat/certified-operator-index:v4.19
+      packages:
+        # CLIFE - Cilium Lifecycle Operator for Cilium Enterprise v1.18
+        - name: clife
+          defaultChannel: "1.18"
+          channels:
+            - name: "1.18"
+
+        # NVIDIA GPU Operator - For L40S GPU support
+        - name: gpu-operator-certified
+          channels:
+            - name: v25.10
+
+        # NVIDIA NIM Operator - For LLM inference (NIMCache, NIMService CRDs)
+        - name: nvidia-nim-operator
+          channels:
+            - name: stable
+
+    # Tetragon Enterprise (separate OLM catalog from Isovalent)
+    - catalog: quay.io/isovalent/tetragon-operator-index:v0.0.1
+      packages:
+        - name: tetragon-operator
+          channels:
+            - name: v1.18
+
+  additionalImages:
+    # CLIFE Operator image - required for Day 1 manifest
+    - name: quay.io/isovalent/clife@sha256:bf1953df529e58d15d1ae9ff1293e6eb22e6e38cc628620420b19cfc6e3e9b99
+
+    # Hubble Timescape v1.18.2
+    - name: quay.io/isovalent/hubble-timescape:v1.18.2
+    - name: quay.io/isovalent/hubble-timescape-lite:v1.18.2
+    - name: quay.io/isovalent/clickhouse-server:25.8.12.129-alpine
+    - name: quay.io/isovalent/certgen:v0.2.4
+    - name: quay.io/isovalent/hubble-timescape-ui:v1.18.2
+    - name: quay.io/isovalent/hubble-k8s-exporter:v1.18.2
+
+    # Vector Log Collector
+    - name: quay.io/isovalent/vector:0.51.0-distroless-libc
+
+    # Altinity ClickHouse Operator v0.25.4
+    - name: docker.io/altinity/clickhouse-operator:0.25.4
+    - name: docker.io/altinity/metrics-exporter:0.25.4
+
+    # Tetragon Enterprise v1.18
+    - name: quay.io/isovalent/tetragon:v1.18.0
+
+    # Splunk OTel Collector
+    - name: quay.io/signalfx/splunk-otel-collector:0.143.0
+
+    # Intersight OTEL Collector - UCS Metrics
+    - name: ghcr.io/cgascoig/intersight-otel:v0.1.2
+    - name: docker.io/otel/opentelemetry-collector-contrib:0.96.0
+
+    # Validation/Debugging Tools
+    - name: registry.redhat.io/openshift4/ose-tools-rhel9:latest
+
+    # Sealed Secrets Controller - Pure GitOps secrets management
+    - name: docker.io/bitnami/sealed-secrets-controller:0.27.3
+
+    # GPU Test Images
+    - name: nvcr.io/nvidia/cuda:12.0.0-base-ubuntu20.04
+    - name: nvcr.io/nvidia/cuda:12.0.0-devel-ubuntu20.04
+
+    # NVIDIA NIM Operator - Helm-based deployment
+    - name: nvcr.io/nvidia/cloud-native/k8s-nim-operator:v3.0.2
+

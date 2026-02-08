@@ -1,0 +1,15 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+apiVersion: config.openshift.io/v1
+kind: ImageDigestMirrorSet
+metadata:
+  name: openshift4-images
+  annotations:
+    createdBy: sync-images workflow
+spec:
+  imageDigestMirrors:
+    - mirrors:
+        - registry.example.com:5000/openshift4
+      source: registry.redhat.io/openshift4

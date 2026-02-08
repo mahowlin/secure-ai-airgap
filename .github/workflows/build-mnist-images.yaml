@@ -1,0 +1,118 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+name: Build MNIST Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag (e.g., v1)"
+        required: true
+        default: "v1"
+      dry_run:
+        description: "Dry run (build but do not push)"
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: registry.example.com:5000
+  IMAGE_PREFIX: mnist
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, saif-github-runner]
+    steps:
+      - name: Checkout instruqt-ml-lab-apps
+        uses: actions/checkout@v4
+        with:
+          repository: isovalent/instruqt-ml-lab-apps
+          ref: main
+
+      - name: Patch Dockerfiles for OpenShift
+        run: |
+          set -euo pipefail
+          # Use unprivileged nginx base and port 8080
+          sed -i 's|FROM nginx:alpine|FROM nginxinc/nginx-unprivileged:alpine|' webapp/Dockerfile
+          sed -i 's|listen 80;|listen 8080;|' webapp/nginx.conf
+          sed -i 's|EXPOSE 80|EXPOSE 8080|' webapp/Dockerfile
+
+          # Pin training/inference to the registry base image tag
+          sed -i "s|FROM mnist:base|FROM ${REGISTRY}/${IMAGE_PREFIX}/base:${{ inputs.image_tag }}|g" training/Dockerfile inference/Dockerfile
+
+          # Ensure training runs as non-root (OpenShift restricted SCC)
+          cat >> training/Dockerfile <<'EOF'
+          RUN groupadd -r appgroup && useradd -r -g appgroup appuser
+          RUN chown -R appuser:appgroup /app
+          USER appuser
+          EOF
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."registry.example.com:5000"]
+              insecure = true
+
+      - name: Build and push base image
+        uses: docker/build-push-action@v5
+        with:
+          context: base
+          push: ${{ !inputs.dry_run }}
+          platforms: linux/amd64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/base:${{ inputs.image_tag }}
+          network: host
+          no-cache: true
+
+      - name: Build and push training image
+        uses: docker/build-push-action@v5
+        with:
+          context: training
+          push: ${{ !inputs.dry_run }}
+          platforms: linux/amd64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/train:${{ inputs.image_tag }}
+          network: host
+          no-cache: true
+
+      - name: Build and push inference image
+        uses: docker/build-push-action@v5
+        with:
+          context: inference
+          push: ${{ !inputs.dry_run }}
+          platforms: linux/amd64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/inference:${{ inputs.image_tag }}
+          network: host
+          no-cache: true
+
+      - name: Build and push webapp image
+        uses: docker/build-push-action@v5
+        with:
+          context: webapp
+          push: ${{ !inputs.dry_run }}
+          platforms: linux/amd64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/webapp:${{ inputs.image_tag }}
+          network: host
+          no-cache: true
+
+  summary:
+    runs-on: [self-hosted, linux, saif-github-runner]
+    needs: build
+    if: always()
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## MNIST Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${{ inputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Dry Run:** ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Images Built" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          for img in base train inference webapp; do
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${img}:${{ inputs.image_tag }}"
+          done >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

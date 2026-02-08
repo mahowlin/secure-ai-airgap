@@ -1,0 +1,17 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+apiVersion: updateservice.operator.openshift.io/v1
+kind: UpdateService
+metadata:
+  annotations:
+    createdAt: Sunday, 01-Feb-26 09:35:48 UTC
+    createdBy: oc-mirror v2
+    oc-mirror_version: 4.19.0-202511270155.p2.g5d64d29.assembly.stream.el9-5d64d29
+  name: update-service-oc-mirror
+spec:
+  graphDataImage: registry.example.com:5000/openshift/graph-image:latest
+  releases: registry.example.com:5000/openshift/release-images
+  replicas: 2
+status: {}

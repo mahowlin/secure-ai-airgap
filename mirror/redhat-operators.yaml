@@ -1,0 +1,36 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+#------------------------------------------------------------------------------
+# Red Hat Operators - redhat-operator-index Only
+#------------------------------------------------------------------------------
+# Split config for parallel mirroring. See images-list.yaml for full config.
+# Estimated time: ~16 min (heaviest catalog)
+#------------------------------------------------------------------------------
+
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  operators:
+    - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.19
+      packages:
+        # Node Feature Discovery - Required for GPU detection
+        - name: nfd
+          channels:
+            - name: stable
+
+        # Local Storage Operator - Optional for local storage
+        - name: local-storage-operator
+          channels:
+            - name: stable
+
+        # LVM Storage Operator - Required for NVME_STORAGE_MDADM_LVMS plan
+        - name: lvms-operator
+          channels:
+            - name: stable-4.19
+
+        # OpenShift GitOps Operator - ArgoCD for GitOps workflows
+        - name: openshift-gitops-operator
+          channels:
+            - name: latest

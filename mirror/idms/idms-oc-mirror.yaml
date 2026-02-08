@@ -1,0 +1,27 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+---
+apiVersion: config.openshift.io/v1
+kind: ImageDigestMirrorSet
+metadata:
+  annotations:
+    createdAt: Sunday, 01-Feb-26 09:34:04 UTC
+    createdBy: oc-mirror v2
+    oc-mirror_version: 4.19.0-202511270155.p2.g5d64d29.assembly.stream.el9-5d64d29
+  name: idms-operator-0
+spec:
+  imageDigestMirrors:
+  - mirrors:
+    - registry.example.com:5000/lvms4
+    source: registry.redhat.io/lvms4
+  - mirrors:
+    - registry.example.com:5000/rhel9
+    source: registry.redhat.io/rhel9
+  - mirrors:
+    - registry.example.com:5000/openshift-gitops-1
+    source: registry.redhat.io/openshift-gitops-1
+  - mirrors:
+    - registry.example.com:5000/openshift4
+    source: registry.redhat.io/openshift4

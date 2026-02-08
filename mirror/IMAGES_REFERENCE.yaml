@@ -1,0 +1,268 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+#------------------------------------------------------------------------------
+# REFERENCE ONLY - Master Image List Documentation
+#------------------------------------------------------------------------------
+# This file documents ALL images for the SAIF environment. It is NOT used
+# directly by the sync-images workflow.
+#
+# ACTUAL WORKFLOW CONFIGS (these are what get mirrored):
+#   - platform-images.yaml   → OCP release images
+#   - redhat-operators.yaml  → Red Hat operator index
+#   - other-images.yaml      → Certified ops + additionalImages
+#
+# When adding new images:
+#   1. Add to this reference file (for documentation)
+#   2. Add to the appropriate workflow config file (for actual mirroring)
+#
+#------------------------------------------------------------------------------
+
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  #----------------------------------------------------------------------------
+  # OpenShift Platform Images
+  #----------------------------------------------------------------------------
+  platform:
+    channels:
+      - name: stable-4.19
+        minVersion: 4.19.21
+        maxVersion: 4.19.21
+        type: ocp
+    graph: true  # Include update graph for cluster upgrades
+
+  #----------------------------------------------------------------------------
+  # Operator Catalog - Selected Operators Only
+  #----------------------------------------------------------------------------
+  operators:
+    # Red Hat Operators (from redhat-operator-index)
+    - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.19
+      packages:
+        # Node Feature Discovery - Required for GPU detection
+        - name: nfd
+          channels:
+            - name: stable
+
+        # Local Storage Operator - Optional for local storage
+        - name: local-storage-operator
+          channels:
+            - name: stable
+
+        # LVM Storage Operator - Required for NVME_STORAGE_MDADM_LVMS plan
+        # Provides dynamic PV provisioning via TopoLVM on mdadm RAID arrays
+        - name: lvms-operator
+          channels:
+            - name: stable-4.19
+
+        # OpenShift GitOps Operator - ArgoCD for GitOps workflows
+        - name: openshift-gitops-operator
+          channels:
+            - name: latest
+
+    # Certified Operators (from certified-operator-index)
+    - catalog: registry.redhat.io/redhat/certified-operator-index:v4.19
+      packages:
+        # CLIFE - Cilium Lifecycle Operator for Cilium Enterprise v1.18
+        - name: clife
+          defaultChannel: "1.18"
+          channels:
+            - name: "1.18"
+
+        # NVIDIA GPU Operator - For L40S GPU support
+        - name: gpu-operator-certified
+          channels:
+            - name: v25.10
+
+        # NVIDIA NIM Operator - For LLM inference (NIMCache, NIMService CRDs)
+        # Required for NVIDIA_NIM_DEPLOYMENT plan
+        - name: nvidia-nim-operator
+          channels:
+            - name: stable
+
+    # Tetragon Enterprise (separate OLM catalog from Isovalent)
+    - catalog: quay.io/isovalent/tetragon-operator-index:v0.0.1
+      packages:
+        - name: tetragon-operator
+          channels:
+            - name: v1.18
+
+  #----------------------------------------------------------------------------
+  # Additional Images - Cilium Enterprise v1.18
+  #----------------------------------------------------------------------------
+  # Note: These images require Isovalent registry access
+  # The certified-operators catalog will pull most Cilium images automatically.
+  # These additional images are for explicit mirroring if needed.
+  additionalImages:
+    # CLIFE Operator image - required for Day 1 manifest
+    # (isovalent-manifests/apps_v1_deployment_clife-controller-manager.yaml)
+    - name: quay.io/isovalent/clife@sha256:bf1953df529e58d15d1ae9ff1293e6eb22e6e38cc628620420b19cfc6e3e9b99
+
+    #--------------------------------------------------------------------------
+    # Hubble Timescape v1.18.2 - Observability stack
+    #--------------------------------------------------------------------------
+    # Required for HUBBLE_TIMESCAPE_INSTALLATION plan
+    # Components: server, ingester, analyzer, migrate
+    - name: quay.io/isovalent/hubble-timescape:v1.18.2
+
+    # Hubble Timescape Lite - All-in-one deployment mode
+    - name: quay.io/isovalent/hubble-timescape-lite:v1.18.2
+
+    # ClickHouse database for Hubble Timescape flow storage
+    # Using tested version from Isovalent Helm values
+    - name: quay.io/isovalent/clickhouse-server:25.8.12.129-alpine
+
+    # Certificate generation for TLS configuration
+    - name: quay.io/isovalent/certgen:v0.2.4
+
+    # Hubble Timescape UI - Dedicated web interface
+    - name: quay.io/isovalent/hubble-timescape-ui:v1.18.2
+
+    # Hubble K8s Exporter - Exports Kubernetes events to Timescape
+    - name: quay.io/isovalent/hubble-k8s-exporter:v1.18.2
+
+    #--------------------------------------------------------------------------
+    # Vector Log Collector
+    #--------------------------------------------------------------------------
+    # Required for Hubble Timescape Push API ingestion
+    # Collects hubble.log, k8s-events.log, tetragon.log and pushes to Timescape
+    # Using Isovalent's Vector image (same vendor as Cilium/Timescape)
+    - name: quay.io/isovalent/vector:0.51.0-distroless-libc
+
+    #--------------------------------------------------------------------------
+    # Altinity ClickHouse Operator v0.25.4
+    #--------------------------------------------------------------------------
+    # Required for Hubble Timescape ClickHouse cluster management
+    # NOTE: docker.io is only source - not available on quay.io/ghcr.io
+    # Rate limiting risk: 100 pulls/6h anonymous. Mitigated by infrequent sync.
+    - name: docker.io/altinity/clickhouse-operator:0.25.4
+    - name: docker.io/altinity/metrics-exporter:0.25.4
+
+    #--------------------------------------------------------------------------
+    # Tetragon Enterprise v1.18 - Runtime Security
+    #--------------------------------------------------------------------------
+    # Required for TETRAGON_INSTALLATION plan
+    # The operator index (in operators section) mirrors bundle metadata only,
+    # the actual agent image must be mirrored separately.
+    - name: quay.io/isovalent/tetragon:v1.18.0
+
+    #--------------------------------------------------------------------------
+    # Hubble UI Enterprise - DISABLED
+    #--------------------------------------------------------------------------
+    # Legacy Hubble UI disabled in favor of Hubble Timescape.
+    # The hubble-ui-enterprise images have stale digests in CLIFE that don't
+    # exist in quay.io (manifest unknown error). Not needed with Timescape.
+    # - name: quay.io/isovalent/hubble-ui-enterprise:v1.3.8
+    # - name: quay.io/isovalent/hubble-ui-enterprise-backend:v1.3.8
+
+    #--------------------------------------------------------------------------
+    # Splunk OTel Collector v0.143.0 - Observability
+    #--------------------------------------------------------------------------
+    # Required for SPLUNK_PLATFORM_INTEGRATION plan
+    # Sends metrics (DCGM, Tetragon, Cilium) to Splunk Observability Cloud
+    - name: quay.io/signalfx/splunk-otel-collector:0.143.0
+
+    #--------------------------------------------------------------------------
+    # Intersight OTEL Collector - UCS Metrics
+    #--------------------------------------------------------------------------
+    # Required for SPLUNK_DASHBOARD_DEMO_QUALITY plan
+    # Collects UCS metrics (power, temp, network) from Intersight API
+    # Source: https://github.com/cgascoig/intersight-otel
+    - name: ghcr.io/cgascoig/intersight-otel:v0.1.2
+    - name: docker.io/otel/opentelemetry-collector-contrib:0.96.0
+
+    #--------------------------------------------------------------------------
+    # Validation/Debugging Tools
+    #--------------------------------------------------------------------------
+    # Required for network connectivity tests and cluster validation
+    - name: registry.redhat.io/openshift4/ose-tools-rhel9:latest
+
+    #--------------------------------------------------------------------------
+    # GPU Test Images
+    #--------------------------------------------------------------------------
+    # Required for GPU_CLUSTER_DEPLOYMENT validation
+    # Using nvcr.io (NVIDIA Container Registry) - auth via NVIDIA_NGC_API_KEY
+    - name: nvcr.io/nvidia/cuda:12.0.0-base-ubuntu20.04
+    - name: nvcr.io/nvidia/cuda:12.0.0-devel-ubuntu20.04
+
+    #--------------------------------------------------------------------------
+    # NVIDIA NIM Operator - Helm-based deployment
+    #--------------------------------------------------------------------------
+    # Required for NVIDIA_NIM_DEPLOYMENT plan
+    # Deployed via Helm chart (charts/k8s-nim-operator) instead of OLM
+    - name: nvcr.io/nvidia/cloud-native/k8s-nim-operator:v3.0.2
+
+    #--------------------------------------------------------------------------
+    # NVIDIA NIM LLaMA 3.1 70B - LLM Inference
+    #--------------------------------------------------------------------------
+    # Required for NVIDIA_NIM_DEPLOYMENT plan (PolicyPilot integration)
+    # LLaMA 3.1 70B with INT4 AWQ quantization (~40GB VRAM at runtime)
+    # Selected per NIM_MODEL_EVALUATION - best quality that fits L40S 48GB
+    # Version 1.15 (Jan 2026), compressed ~10GB
+    #
+    # TEMPORARILY DISABLED: NGC throttles downloads to ~1 MB/s, causing 120m timeout
+    # This 9GB image needs dedicated sync workflow with resume capability
+    # See: SYNC_IMAGES_PIPELINE_OPTIMIZATION.md Phase 1
+    # - name: nvcr.io/nim/meta/llama-3.1-70b-instruct:1.15
+
+  #----------------------------------------------------------------------------
+  # Helm Charts - For Day 2 Operations
+  #----------------------------------------------------------------------------
+  helm: {}
+
+#------------------------------------------------------------------------------
+# Notes:
+#------------------------------------------------------------------------------
+#
+# Hubble Timescape v1.18.2:
+# The Hubble Timescape images are explicitly listed in additionalImages because
+# they are not part of any OLM catalog. These are required for the
+# HUBBLE_TIMESCAPE_INSTALLATION plan.
+# Components:
+# - hubble-timescape: Main server, ingester, analyzer, migrate components
+# - hubble-timescape-lite: All-in-one deployment for smaller environments
+# - hubble-timescape-ui: Dedicated web interface for Timescape
+# - hubble-k8s-exporter: Exports K8s events (NetworkPolicy, CiliumIdentity, etc.)
+# - clickhouse-server: ClickHouse database for flow storage
+# - certgen: Certificate generation for TLS
+#
+# Vector + Altinity ClickHouse Operator:
+# Required for full Timescape deployment (not Lite mode).
+# - vector: Log collector that reads hubble.log/tetragon.log and pushes to Timescape
+# - clickhouse-operator: Manages ClickHouse StatefulSet via CRD
+# - metrics-exporter: Prometheus metrics for ClickHouse
+#
+# NVIDIA AI Enterprise (NVAIE) / NIM images:
+# These are NOT included in this config because they require NGC credentials
+# and are very large (~15-20GB for LLaMA models). The workflow supports NGC
+# auth via the NVIDIA_NGC_API_KEY secret.
+#
+# For NVIDIA NIM deployment, the following images will be pulled at runtime:
+#   - nvcr.io/nim/meta/llama-3.1-8b-instruct:latest (~15-20GB)
+#
+# Manual mirroring (if needed):
+#   docker login nvcr.io -u '$oauthtoken' -p $NGC_API_KEY
+#   docker pull nvcr.io/nim/meta/llama-3.1-8b-instruct:latest
+#   docker tag nvcr.io/nim/meta/llama-3.1-8b-instruct:latest registry.example.com:5000/nim/meta/llama-3.1-8b-instruct:latest
+#   docker push registry.example.com:5000/nim/meta/llama-3.1-8b-instruct:latest
+#
+# Cilium Enterprise v1.18 images:
+# The certified-operators catalog (CLIFE channel 1.18) will automatically pull
+# most Cilium Enterprise images. The CLIFE operator image is explicitly listed
+# in additionalImages because it's required by the Day 1 manifest.
+#
+# Tetragon Enterprise v1.18:
+# Deployed via its own OLM catalog (quay.io/isovalent/tetragon-operator-index)
+# which is included in the operators section above.
+#
+# Estimated sizes:
+# - OpenShift 4.19 platform:   ~15-20 GB
+# - Selected operators:        ~5-10 GB
+# - Cilium images:             ~2-3 GB
+# - Hubble Timescape + Vector: ~4-5 GB
+# - Altinity ClickHouse:       ~1 GB
+# - GPU test images:           ~5-6 GB
+# - Total:                     ~40-50 GB
+#
+#------------------------------------------------------------------------------

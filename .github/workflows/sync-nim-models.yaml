@@ -1,0 +1,167 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+name: 'Sync NIM Models'
+
+# Downloads NIM model weights to runner VM for air-gapped cluster deployment
+# Models are served via HTTP from existing nginx web server
+#
+# Uses WebDAV PUT for file uploads (same pattern as ISO upload)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Model to download'
+        required: true
+        type: choice
+        options:
+          - llama-3.1-70b-instruct
+          - llama-3.1-8b-instruct
+      force_download:
+        description: 'Force re-download even if cache exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CACHE_BASE: /data/images/nim-cache
+  REGISTRY: registry.example.com:5000
+  IMAGE_TAG: "1.15"
+  HTTP_SERVER: http://10.0.0.10
+
+jobs:
+  download-model:
+    name: Download Model Cache
+    runs-on: [self-hosted, linux, saif-github-runner]
+    env:
+      HTTP_USER: ${{ secrets.HTTP_SERVER_USER }}
+      HTTP_PASS: ${{ secrets.HTTP_SERVER_PASSWORD }}
+    steps:
+      - name: Setup
+        id: setup
+        run: |
+          MODEL="${{ github.event.inputs.model }}"
+          CACHE_PATH="${CACHE_BASE}/${MODEL}"
+          CACHE_URL="${HTTP_SERVER}/nim-cache/${MODEL}"
+          echo "cache_path=$CACHE_PATH" >> $GITHUB_OUTPUT
+          echo "cache_url=$CACHE_URL" >> $GITHUB_OUTPUT
+          echo "model=$MODEL" >> $GITHUB_OUTPUT
+
+      - name: Check existing cache
+        id: cache_check
+        run: |
+          set +H
+          CACHE_URL="${{ steps.setup.outputs.cache_url }}"
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u "${HTTP_USER}:${HTTP_PASS}" \
+            "${CACHE_URL}/.cache-ready")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "::notice::Valid cache found"
+            curl -s -u "${HTTP_USER}:${HTTP_PASS}" "${CACHE_URL}/.cache-ready"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "::notice::No valid cache (HTTP $HTTP_STATUS)"
+          fi
+
+      - name: Download model cache
+        id: download
+        if: steps.cache_check.outputs.exists != 'true' || github.event.inputs.force_download == 'true'
+        env:
+          NGC_API_KEY: ${{ secrets.NVIDIA_NGC_API_KEY }}
+        run: |
+          set +H
+          MODEL="${{ steps.setup.outputs.model }}"
+          CACHE_PATH="${{ steps.setup.outputs.cache_path }}"
+          CACHE_URL="${{ steps.setup.outputs.cache_url }}"
+          IMAGE="${REGISTRY}/nim/meta/${MODEL}:${IMAGE_TAG}"
+
+          # Delete old cache-ready marker via WebDAV
+          curl -s -u "${HTTP_USER}:${HTTP_PASS}" -X DELETE "${CACHE_URL}/.cache-ready" || true
+
+          echo "::group::Pulling NIM image"
+          docker pull "$IMAGE"
+          echo "::endgroup::"
+
+          echo "::group::Downloading model cache (this takes 2-4 hours for 70B)"
+          docker run --rm \
+            -e NGC_API_KEY="$NGC_API_KEY" \
+            -v "${CACHE_PATH}:/opt/nim/.cache" \
+            "$IMAGE" \
+            download-to-cache
+
+          echo "download_success=true" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+
+      - name: Create integrity markers
+        if: steps.download.outputs.download_success == 'true'
+        run: |
+          set +H
+          MODEL="${{ steps.setup.outputs.model }}"
+          CACHE_URL="${{ steps.setup.outputs.cache_url }}"
+
+          # Create cache-ready marker
+          MARKER=$(cat << EOF
+          model=${MODEL}
+          image_tag=${IMAGE_TAG}
+          timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+          )
+
+          # Upload via WebDAV PUT
+          echo "$MARKER" | curl -s -u "${HTTP_USER}:${HTTP_PASS}" \
+            -T - \
+            "${CACHE_URL}/.cache-ready"
+
+          echo "::notice::Cache ready marker uploaded"
+
+      - name: Verify HTTP access
+        run: |
+          set +H
+          CACHE_URL="${{ steps.setup.outputs.cache_url }}"
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u "${HTTP_USER}:${HTTP_PASS}" \
+            "${CACHE_URL}/.cache-ready")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "✅ Cache accessible via HTTP"
+            curl -s -u "${HTTP_USER}:${HTTP_PASS}" "${CACHE_URL}/.cache-ready"
+          else
+            echo "::error::Cache not accessible (HTTP $HTTP_STATUS)"
+            exit 1
+          fi
+
+      - name: Summary
+        run: |
+          set +H
+          MODEL="${{ steps.setup.outputs.model }}"
+          CACHE_URL="${{ steps.setup.outputs.cache_url }}"
+
+          echo "## NIM Model Cache" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Model:** $MODEL" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** $IMAGE_TAG" >> $GITHUB_STEP_SUMMARY
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u "${HTTP_USER}:${HTTP_PASS}" \
+            "${CACHE_URL}/.cache-ready")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "**Status:** ✅ Ready" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Cache Info" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            curl -s -u "${HTTP_USER}:${HTTP_PASS}" "${CACHE_URL}/.cache-ready" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**HTTP URL:** ${CACHE_URL}/" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Status:** ❌ Not Ready" >> $GITHUB_STEP_SUMMARY
+          fi

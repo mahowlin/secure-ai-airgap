@@ -1,0 +1,252 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+name: 'Sync NVIDIA LLM'
+
+# Mirrors NVIDIA NIM LLM container images to local registry
+# Uses docker pull/push instead of oc-mirror to handle NGC throttling
+#
+# Why not oc-mirror?
+# - NGC throttles downloads to ~1-2 MB/s after initial burst
+# - oc-mirror has per-blob timeouts that fail on throttled connections
+# - docker pull has no per-blob timeout (works with throttling)
+#
+# Usage:
+#   gh workflow run sync-nvidia-llm.yaml -f image=nvcr.io/nim/meta/llama-3.1-70b-instruct:1.15
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'NIM image reference (e.g., nvcr.io/nim/meta/llama-3.1-70b-instruct:1.15)'
+        required: true
+        type: string
+      skip_if_exists:
+        description: 'Skip if image already exists in local registry'
+        required: false
+        type: boolean
+        default: true
+      force_pull:
+        description: 'Force pull even if cached locally'
+        required: false
+        type: boolean
+        default: false
+
+  workflow_call:
+    inputs:
+      image:
+        type: string
+        required: true
+      skip_if_exists:
+        type: boolean
+        default: true
+      force_pull:
+        type: boolean
+        default: false
+    secrets:
+      NVIDIA_NGC_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  LOCAL_REGISTRY: ${{ vars.OCP_REGISTRY_URL }}
+
+jobs:
+  sync-nvidia-llm:
+    name: 'Mirror NVIDIA LLM Image'
+    runs-on: [self-hosted, linux, saif-github-runner]
+    # Run directly on runner (not in container) for docker access
+    timeout-minutes: 360  # 6 hours for large NIM images (~10GB compressed)
+
+    steps:
+    - name: Parse Image Reference
+      id: parse
+      run: |
+        IMAGE="${{ inputs.image }}"
+
+        # Extract registry, repository, and tag
+        # Handle different formats: registry/repo:tag, registry/repo@sha256:...
+        if [[ "$IMAGE" == *"@sha256:"* ]]; then
+          REGISTRY_REPO="${IMAGE%%@*}"
+          TAG="${IMAGE##*@}"
+          IS_DIGEST=true
+        else
+          REGISTRY_REPO="${IMAGE%%:*}"
+          TAG="${IMAGE##*:}"
+          IS_DIGEST=false
+        fi
+
+        # Extract registry (first component before /)
+        REGISTRY="${REGISTRY_REPO%%/*}"
+        REPO="${REGISTRY_REPO#*/}"
+
+        # Construct local image reference
+        LOCAL_IMAGE="${LOCAL_REGISTRY}/${REPO}:${TAG##sha256:}"
+        if [ "$IS_DIGEST" = "true" ]; then
+          LOCAL_IMAGE="${LOCAL_REGISTRY}/${REPO}@${TAG}"
+        fi
+
+        echo "source_image=$IMAGE" >> $GITHUB_OUTPUT
+        echo "source_registry=$REGISTRY" >> $GITHUB_OUTPUT
+        echo "repository=$REPO" >> $GITHUB_OUTPUT
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "local_image=$LOCAL_IMAGE" >> $GITHUB_OUTPUT
+        echo "is_digest=$IS_DIGEST" >> $GITHUB_OUTPUT
+
+        echo "## Image Details" >> $GITHUB_STEP_SUMMARY
+        echo "- **Source:** $IMAGE" >> $GITHUB_STEP_SUMMARY
+        echo "- **Registry:** $REGISTRY" >> $GITHUB_STEP_SUMMARY
+        echo "- **Repository:** $REPO" >> $GITHUB_STEP_SUMMARY
+        echo "- **Tag:** $TAG" >> $GITHUB_STEP_SUMMARY
+        echo "- **Local:** $LOCAL_IMAGE" >> $GITHUB_STEP_SUMMARY
+
+    - name: Check Local Registry
+      id: check_local
+      if: inputs.skip_if_exists == true
+      run: |
+        LOCAL_IMAGE="${{ steps.parse.outputs.local_image }}"
+
+        echo "Checking if image exists in local registry..."
+
+        # Use skopeo to check if image exists (faster than docker pull)
+        if skopeo inspect --tls-verify=false "docker://${LOCAL_IMAGE}" > /dev/null 2>&1; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+          echo "Image already exists in local registry"
+          echo "## Result: Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "Image already exists at \`${LOCAL_IMAGE}\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+          echo "Image not found in local registry, will pull"
+        fi
+
+    - name: Configure Registry Auth
+      if: steps.check_local.outputs.exists != 'true'
+      env:
+        NVIDIA_NGC_API_KEY: ${{ secrets.NVIDIA_NGC_API_KEY }}
+      run: |
+        SOURCE_REGISTRY="${{ steps.parse.outputs.source_registry }}"
+
+        mkdir -p ~/.docker
+        echo '{"auths":{}}' > ~/.docker/config.json
+
+        # Add NGC auth for nvcr.io
+        if [[ "$SOURCE_REGISTRY" == "nvcr.io" ]] && [ -n "$NVIDIA_NGC_API_KEY" ]; then
+          echo "Configuring NVIDIA NGC authentication..."
+          echo "$NVIDIA_NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+        fi
+
+        echo "Registry authentication configured for $SOURCE_REGISTRY"
+
+    - name: Pull Image
+      id: pull
+      if: steps.check_local.outputs.exists != 'true'
+      run: |
+        SOURCE_IMAGE="${{ steps.parse.outputs.source_image }}"
+        FORCE_PULL="${{ inputs.force_pull }}"
+
+        echo "## Pull Progress" >> $GITHUB_STEP_SUMMARY
+
+        # Check if image is cached locally
+        if [ "$FORCE_PULL" != "true" ] && docker image inspect "$SOURCE_IMAGE" > /dev/null 2>&1; then
+          echo "Image found in local Docker cache, skipping pull"
+          echo "Used local cache (skipped download)" >> $GITHUB_STEP_SUMMARY
+          echo "cached=true" >> $GITHUB_OUTPUT
+        else
+          echo "Pulling $SOURCE_IMAGE..."
+          echo "This may take several hours for large images with NGC throttling."
+          echo ""
+
+          START_TIME=$(date +%s)
+
+          # docker pull with progress
+          if docker pull "$SOURCE_IMAGE"; then
+            END_TIME=$(date +%s)
+            DURATION=$((END_TIME - START_TIME))
+            DURATION_MIN=$((DURATION / 60))
+
+            # Get image size
+            SIZE=$(docker image inspect "$SOURCE_IMAGE" --format '{{.Size}}' | numfmt --to=iec-i --suffix=B)
+
+            echo "pull_success=true" >> $GITHUB_OUTPUT
+            echo "duration_min=$DURATION_MIN" >> $GITHUB_OUTPUT
+            echo "size=$SIZE" >> $GITHUB_OUTPUT
+
+            echo "- **Duration:** ${DURATION_MIN} minutes" >> $GITHUB_STEP_SUMMARY
+            echo "- **Size:** $SIZE" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "::error::Failed to pull image"
+            echo "- **Status:** FAILED" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+        fi
+
+    - name: Tag for Local Registry
+      if: steps.check_local.outputs.exists != 'true'
+      run: |
+        SOURCE_IMAGE="${{ steps.parse.outputs.source_image }}"
+        LOCAL_IMAGE="${{ steps.parse.outputs.local_image }}"
+
+        echo "Tagging for local registry..."
+        docker tag "$SOURCE_IMAGE" "$LOCAL_IMAGE"
+        echo "Tagged: $LOCAL_IMAGE"
+
+    - name: Push to Local Registry
+      id: push
+      if: steps.check_local.outputs.exists != 'true'
+      run: |
+        LOCAL_IMAGE="${{ steps.parse.outputs.local_image }}"
+
+        echo "Pushing to local registry..."
+        START_TIME=$(date +%s)
+
+        if docker push "$LOCAL_IMAGE"; then
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+
+          echo "push_success=true" >> $GITHUB_OUTPUT
+          echo "push_duration=$DURATION" >> $GITHUB_OUTPUT
+
+          echo "## Push Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **Duration:** ${DURATION} seconds" >> $GITHUB_STEP_SUMMARY
+          echo "- **Destination:** \`$LOCAL_IMAGE\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "::error::Failed to push image to local registry"
+          exit 1
+        fi
+
+    - name: Verify Mirror
+      if: steps.check_local.outputs.exists != 'true'
+      run: |
+        LOCAL_IMAGE="${{ steps.parse.outputs.local_image }}"
+
+        echo "Verifying image in local registry..."
+        if skopeo inspect --tls-verify=false "docker://${LOCAL_IMAGE}" > /dev/null 2>&1; then
+          echo "## Verification: SUCCESS" >> $GITHUB_STEP_SUMMARY
+          echo "Image successfully mirrored to \`${LOCAL_IMAGE}\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "::error::Image not found in local registry after push"
+          exit 1
+        fi
+
+    - name: Cleanup
+      if: always()
+      run: |
+        # Optionally clean up local docker cache to save disk space
+        # Uncomment if disk space is a concern
+        # docker image prune -f
+
+        # Remove auth config
+        rm -f ~/.docker/config.json
+
+        echo "Cleanup complete"
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "**Workflow:** sync-nvidia-llm" >> $GITHUB_STEP_SUMMARY
+        echo "**Runner:** $(hostname)" >> $GITHUB_STEP_SUMMARY

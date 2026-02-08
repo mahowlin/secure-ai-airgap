@@ -1,0 +1,83 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+name: 'Configure Runner VM'
+
+# Provisions and configures the GitHub Actions runner VM
+# Services managed: DinD runners, container registry, web server (nginx), Gitea
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: 'Ansible tags to run (e.g., runner, gitea, registry, webserver, all)'
+        required: false
+        default: 'all'
+        type: string
+      runner_token:
+        description: 'GitHub runner registration token (leave empty to auto-generate)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    name: 'Run Ansible Playbook'
+    runs-on: [self-hosted, linux, saif-github-runner]
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install Ansible
+      run: |
+        if ! command -v ansible &> /dev/null; then
+          echo "Installing Ansible..."
+          sudo apt-get update
+          sudo apt-get install -y ansible
+        fi
+        ansible --version
+
+    - name: Install Ansible Collections
+      run: |
+        ansible-galaxy collection install -r ansible/requirements.yml
+
+    - name: Generate Runner Token
+      if: inputs.runner_token == ''
+      id: token
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TOKEN=$(gh api -X POST /orgs/mahowlin/actions/runners/registration-token --jq '.token')
+        echo "::add-mask::$TOKEN"
+        echo "runner_token=$TOKEN" >> $GITHUB_OUTPUT
+
+    - name: Run Ansible Playbook
+      env:
+        ANSIBLE_HOST_KEY_CHECKING: 'false'
+        RUNNER_TOKEN: ${{ inputs.runner_token || steps.token.outputs.runner_token }}
+      run: |
+        cd ansible/playbooks
+        ansible-playbook -i ../../environments/example/hosts.ini \
+          configure-runner.yaml \
+          --extra-vars "runner_token=${RUNNER_TOKEN}" \
+          --tags "${{ inputs.tags }}"
+
+    - name: Verify Runners
+      if: contains(inputs.tags, 'runner') || inputs.tags == 'all'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "Checking runner status..."
+        gh api /orgs/mahowlin/actions/runners --jq '.runners[] | "\(.name): \(.status)"'
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "## Runner VM Configuration" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Tags:** ${{ inputs.tags }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY

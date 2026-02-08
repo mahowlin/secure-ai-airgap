@@ -1,0 +1,526 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+name: Manage Cluster Users
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Target cluster'
+        required: true
+        type: choice
+        options:
+          - ai-pod-1
+          - ai-pod-2
+          - ai-pod-3
+          - ai-pod-4
+      users:
+        description: 'Comma-separated usernames (e.g., mahowlin,jdoe)'
+        required: true
+        type: string
+      emails:
+        description: 'Comma-separated emails matching usernames (e.g., mahowlin@cisco.com,jdoe@cisco.com)'
+        required: false
+        type: string
+      password:
+        description: 'Password for all users (leave blank for random 16-char password)'
+        required: false
+        type: string
+      role:
+        description: 'ClusterRole to assign'
+        required: true
+        type: choice
+        options:
+          - cluster-admin
+          - admin
+          - edit
+          - view
+        default: cluster-admin
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - create
+          - delete
+          - list
+        default: create
+      ssh_pubkeys:
+        description: 'SSH public keys (one per user, comma-separated). Required for create action.'
+        required: false
+        type: string
+
+env:
+  CLUSTER_NAME: ${{ inputs.cluster_name }}
+  HTPASSWD_SECRET: htpasswd-secret
+  HTPASSWD_IDP_NAME: htpasswd
+  JUMP_HOST: 10.0.0.10
+  JUMP_HOST_USER: ubuntu
+
+jobs:
+  manage-users:
+    name: ${{ inputs.action }} users on ${{ inputs.cluster_name }}
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get Kubeconfig
+        env:
+          KUBECONFIG_REPO_TOKEN: ${{ secrets.KUBECONFIG_REPO_TOKEN }}
+        run: |
+          set -e
+
+          echo "Fetching kubeconfig for $CLUSTER_NAME..."
+
+          git clone --depth 1 \
+            # Configure this URL for your kubeconfig storage repository
+            "https://x-access-token:${KUBECONFIG_REPO_TOKEN}@github.com/mahowlin/saif-kubeconfigs.git" \
+            /tmp/kubeconfigs
+
+          KUBECONFIG_FILE="/tmp/kubeconfigs/clusters/${CLUSTER_NAME}/kubeconfig"
+
+          if [[ ! -f "$KUBECONFIG_FILE" ]]; then
+            echo "ERROR: Kubeconfig not found for $CLUSTER_NAME"
+            echo "Has the cluster been deployed?"
+            exit 1
+          fi
+
+          export KUBECONFIG="$KUBECONFIG_FILE"
+          echo "KUBECONFIG=$KUBECONFIG" >> $GITHUB_ENV
+
+          # Test connectivity
+          echo "Testing cluster connectivity..."
+          if ! oc whoami &>/dev/null; then
+            echo "ERROR: Cannot connect to cluster $CLUSTER_NAME"
+            exit 1
+          fi
+
+          echo "Connected as: $(oc whoami)"
+
+      - name: List Current Users
+        if: inputs.action == 'list'
+        run: |
+          echo "## User List for $CLUSTER_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check if HTPasswd secret exists
+          if oc get secret $HTPASSWD_SECRET -n openshift-config &>/dev/null; then
+            echo "### HTPasswd Users" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Username |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|" >> $GITHUB_STEP_SUMMARY
+
+            # Extract and list usernames from htpasswd file
+            oc get secret $HTPASSWD_SECRET -n openshift-config -o jsonpath='{.data.htpasswd}' | \
+              base64 -d | cut -d: -f1 | while read user; do
+                echo "| $user |" >> $GITHUB_STEP_SUMMARY
+              done
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No HTPasswd identity provider configured yet." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "### ClusterRoleBindings (workflow-managed)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          BINDINGS=$(oc get clusterrolebindings -l managed-by=manage-cluster-users-workflow -o json 2>/dev/null)
+          if [[ $(echo "$BINDINGS" | jq '.items | length') -gt 0 ]]; then
+            echo "| User | Role |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+            echo "$BINDINGS" | jq -r '.items[] | "| \(.subjects[0].name) | \(.roleRef.name) |"' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No workflow-managed bindings found." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Create Users
+        if: inputs.action == 'create'
+        env:
+          WEBEX_BOT_TOKEN: ${{ secrets.WEBEX_BOT_TOKEN }}
+          USER_PASSWORD: ${{ inputs.password }}
+        run: |
+          set -e
+
+          # Parse comma-separated users and emails
+          IFS=',' read -ra USERS <<< "${{ inputs.users }}"
+          IFS=',' read -ra EMAILS <<< "${{ inputs.emails }}"
+
+          echo "## User Creation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Cluster:** $CLUSTER_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "**Role:** ${{ inputs.role }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Get existing htpasswd file or create empty one
+          HTPASSWD_FILE="/tmp/htpasswd"
+          if oc get secret $HTPASSWD_SECRET -n openshift-config &>/dev/null; then
+            echo "Retrieving existing htpasswd file..."
+            oc get secret $HTPASSWD_SECRET -n openshift-config -o jsonpath='{.data.htpasswd}' | base64 -d > $HTPASSWD_FILE
+          else
+            echo "Creating new htpasswd file..."
+            touch $HTPASSWD_FILE
+          fi
+
+          echo "### Users Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Username | Notification |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------------|" >> $GITHUB_STEP_SUMMARY
+
+          # Process each user
+          for i in "${!USERS[@]}"; do
+            user=$(echo "${USERS[$i]}" | xargs)  # Trim whitespace
+            [[ -z "$user" ]] && continue
+
+            # Get corresponding email (if provided)
+            email=""
+            if [[ $i -lt ${#EMAILS[@]} ]]; then
+              email=$(echo "${EMAILS[$i]}" | xargs)
+            fi
+
+            # Use provided password or generate random (16 chars, alphanumeric)
+            if [[ -n "$USER_PASSWORD" ]]; then
+              PASSWORD="$USER_PASSWORD"
+            else
+              PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)
+            fi
+
+            # Add/update user in htpasswd file using Python bcrypt
+            # Use environment variable to safely handle special characters
+            # Replace $2b$ with $2a$ for OpenShift compatibility
+            HASH=$(PASSWORD="$PASSWORD" python3 -c "import os, bcrypt; h=bcrypt.hashpw(os.environ['PASSWORD'].encode(), bcrypt.gensalt()).decode(); print(h.replace('\$2b\$', '\$2a\$', 1))")
+
+            # Remove existing entry if present, then add new one
+            grep -v "^${user}:" $HTPASSWD_FILE > /tmp/htpasswd.tmp || true
+            echo "${user}:${HASH}" >> /tmp/htpasswd.tmp
+            mv /tmp/htpasswd.tmp $HTPASSWD_FILE
+
+            # Create ClusterRoleBinding
+            BINDING_NAME="${user}-${{ inputs.role }}"
+            cat <<EOF | oc apply -f -
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: ${BINDING_NAME}
+            labels:
+              managed-by: manage-cluster-users-workflow
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: ${{ inputs.role }}
+          subjects:
+          - apiGroup: rbac.authorization.k8s.io
+            kind: User
+            name: ${user}
+          EOF
+
+            echo "Created ClusterRoleBinding: $BINDING_NAME"
+
+            # Send WebEx notification if email provided and token available
+            NOTIFIED="No email provided"
+            if [[ -n "$email" ]] && [[ -n "$WEBEX_BOT_TOKEN" ]]; then
+              # Get cluster IP from cluster-mappings.yaml
+              CLUSTER_IP=$(yq4 -r ".clusters[] | select(.name == \"${CLUSTER_NAME}\") | .ip" openshift/cluster-mappings.yaml)
+
+              # Prepare WebEx message (Markdown format - concise)
+              MESSAGE=$(cat <<WEBEX_EOF
+          **🐻 SAIF AI Pod - ${CLUSTER_NAME}**
+
+          **Cluster:** \`${CLUSTER_NAME}\` | **User:** \`${user}\` | **Role:** \`${{ inputs.role }}\`
+          **Password:** \`${PASSWORD}\`
+
+          ---
+
+          **Quick Start** (requires VPN + oc CLI + sudo)
+
+          **1. Start SSH tunnel:**
+          \`\`\`
+          sudo -E ssh -f -N -L 6443:${CLUSTER_IP}:6443 -L 443:${CLUSTER_IP}:443 ${user}@${JUMP_HOST}
+          \`\`\`
+
+          **2. Add hosts entry** (one-time):
+          \`\`\`
+          sudo sh -c 'echo "127.0.0.1 oauth-openshift.apps.${CLUSTER_NAME}.example.com" >> /etc/hosts'
+          \`\`\`
+
+          **3. Login:**
+          \`\`\`
+          oc login https://127.0.0.1:6443 -u ${user} --insecure-skip-tls-verify
+          \`\`\`
+
+          **4. Verify:**
+          \`\`\`
+          oc whoami && oc get nodes
+          \`\`\`
+
+          📖 [Docs](https://github.com/mahowlin/saif-ai-pod)
+          WEBEX_EOF
+          )
+
+              # Send WebEx direct message
+              HTTP_CODE=$(curl -s -o /tmp/webex_response.json -w "%{http_code}" \
+                -X POST "https://webexapis.com/v1/messages" \
+                -H "Authorization: Bearer ${WEBEX_BOT_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg email "$email" --arg md "$MESSAGE" '{toPersonEmail: $email, markdown: $md}')")
+
+              if [[ "$HTTP_CODE" == "200" ]]; then
+                NOTIFIED="Sent to $email"
+                echo "WebEx notification sent to $email"
+              else
+                NOTIFIED="Failed ($HTTP_CODE)"
+                echo "WARNING: WebEx notification failed for $email (HTTP $HTTP_CODE)"
+                cat /tmp/webex_response.json
+              fi
+            fi
+
+            echo "| $user | $NOTIFIED |" >> $GITHUB_STEP_SUMMARY
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Create or update the htpasswd secret
+          echo "Updating HTPasswd secret..."
+          oc create secret generic $HTPASSWD_SECRET \
+            --from-file=htpasswd=$HTPASSWD_FILE \
+            -n openshift-config \
+            --dry-run=client -o yaml | oc apply -f -
+
+          # Ensure OAuth is configured with HTPasswd provider
+          echo "Configuring OAuth identity provider..."
+
+          # Check if htpasswd IDP already exists
+          EXISTING_IDP=$(oc get oauth cluster -o json | jq -r ".spec.identityProviders // [] | map(select(.name == \"$HTPASSWD_IDP_NAME\")) | length")
+
+          if [[ "$EXISTING_IDP" == "0" ]]; then
+            echo "Adding HTPasswd identity provider to OAuth..."
+
+            # Patch OAuth to add htpasswd provider
+            oc patch oauth cluster --type=json -p="[{
+              \"op\": \"add\",
+              \"path\": \"/spec/identityProviders/-\",
+              \"value\": {
+                \"name\": \"$HTPASSWD_IDP_NAME\",
+                \"mappingMethod\": \"claim\",
+                \"type\": \"HTPasswd\",
+                \"htpasswd\": {
+                  \"fileData\": {
+                    \"name\": \"$HTPASSWD_SECRET\"
+                  }
+                }
+              }
+            }]" 2>/dev/null || \
+            # If identityProviders doesn't exist yet, create it
+            oc patch oauth cluster --type=merge -p="{
+              \"spec\": {
+                \"identityProviders\": [{
+                  \"name\": \"$HTPASSWD_IDP_NAME\",
+                  \"mappingMethod\": \"claim\",
+                  \"type\": \"HTPasswd\",
+                  \"htpasswd\": {
+                    \"fileData\": {
+                      \"name\": \"$HTPASSWD_SECRET\"
+                    }
+                  }
+                }]
+              }
+            }"
+
+            echo "HTPasswd identity provider added"
+          else
+            echo "HTPasswd identity provider already configured"
+          fi
+
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Users have been notified via WebEx with their access details." >> $GITHUB_STEP_SUMMARY
+
+      - name: Create Jump Host Users
+        if: inputs.action == 'create' && inputs.ssh_pubkeys != ''
+        env:
+          JUMP_HOST_SSH_KEY: ${{ secrets.JUMP_HOST_SSH_KEY }}
+        run: |
+          set -e
+
+          echo "## Jump Host User Creation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Parse users and SSH keys
+          IFS=',' read -ra USERS <<< "${{ inputs.users }}"
+          IFS=',' read -ra PUBKEYS <<< "${{ inputs.ssh_pubkeys }}"
+
+          # Setup SSH key for jump host access
+          mkdir -p ~/.ssh
+          echo "$JUMP_HOST_SSH_KEY" > ~/.ssh/jump_host_key
+          chmod 600 ~/.ssh/jump_host_key
+
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/jump_host_key"
+
+          echo "| Username | Jump Host Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|------------------|" >> $GITHUB_STEP_SUMMARY
+
+          for i in "${!USERS[@]}"; do
+            user=$(echo "${USERS[$i]}" | xargs)
+            [[ -z "$user" ]] && continue
+
+            # Get corresponding SSH public key
+            pubkey=""
+            if [[ $i -lt ${#PUBKEYS[@]} ]]; then
+              pubkey=$(echo "${PUBKEYS[$i]}" | xargs)
+            fi
+
+            if [[ -z "$pubkey" ]]; then
+              echo "| $user | Skipped (no SSH key) |" >> $GITHUB_STEP_SUMMARY
+              continue
+            fi
+
+            echo "Creating jump host user: $user"
+
+            # Create user on jump host via SSH
+            ssh $SSH_OPTS ${JUMP_HOST_USER}@${JUMP_HOST} "
+              sudo useradd -m -s /bin/bash '$user' 2>/dev/null || true
+              sudo mkdir -p /home/'$user'/.ssh
+              echo '$pubkey' | sudo tee /home/'$user'/.ssh/authorized_keys > /dev/null
+              sudo chown -R '$user':'$user' /home/'$user'/.ssh
+              sudo chmod 700 /home/'$user'/.ssh
+              sudo chmod 600 /home/'$user'/.ssh/authorized_keys
+            "
+
+            echo "| $user | Created |" >> $GITHUB_STEP_SUMMARY
+          done
+
+          # Cleanup
+          rm -f ~/.ssh/jump_host_key
+
+      - name: Delete Users
+        if: inputs.action == 'delete'
+        run: |
+          set -e
+
+          IFS=',' read -ra USERS <<< "${{ inputs.users }}"
+
+          echo "## User Deletion Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Cluster:** $CLUSTER_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Get existing htpasswd file
+          HTPASSWD_FILE="/tmp/htpasswd"
+          if oc get secret $HTPASSWD_SECRET -n openshift-config &>/dev/null; then
+            oc get secret $HTPASSWD_SECRET -n openshift-config -o jsonpath='{.data.htpasswd}' | base64 -d > $HTPASSWD_FILE
+          else
+            echo "No HTPasswd secret found - nothing to delete"
+            exit 0
+          fi
+
+          echo "| Username | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          for user in "${USERS[@]}"; do
+            user=$(echo "$user" | xargs)
+            [[ -z "$user" ]] && continue
+
+            # Remove from htpasswd file
+            if grep -q "^${user}:" $HTPASSWD_FILE; then
+              grep -v "^${user}:" $HTPASSWD_FILE > /tmp/htpasswd.tmp || true
+              mv /tmp/htpasswd.tmp $HTPASSWD_FILE
+              echo "Removed $user from htpasswd"
+            fi
+
+            # Delete ClusterRoleBindings for this user
+            BINDINGS=$(oc get clusterrolebindings -o json | \
+              jq -r ".items[] | select(.subjects[]?.name == \"$user\") | .metadata.name" | sort -u)
+
+            for binding in $BINDINGS; do
+              oc delete clusterrolebinding "$binding" 2>/dev/null || true
+              echo "Deleted ClusterRoleBinding: $binding"
+            done
+
+            # Delete identity if exists
+            oc delete identity "${HTPASSWD_IDP_NAME}:${user}" 2>/dev/null || true
+
+            # Delete user object if exists
+            oc delete user "$user" 2>/dev/null || true
+
+            echo "| $user | Deleted |" >> $GITHUB_STEP_SUMMARY
+          done
+
+          # Update the htpasswd secret
+          oc create secret generic $HTPASSWD_SECRET \
+            --from-file=htpasswd=$HTPASSWD_FILE \
+            -n openshift-config \
+            --dry-run=client -o yaml | oc apply -f -
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Users removed successfully." >> $GITHUB_STEP_SUMMARY
+
+      - name: Delete Jump Host Users
+        if: inputs.action == 'delete'
+        env:
+          JUMP_HOST_SSH_KEY: ${{ secrets.JUMP_HOST_SSH_KEY }}
+        run: |
+          set -e
+
+          # Only proceed if we have SSH access to jump host
+          if [[ -z "$JUMP_HOST_SSH_KEY" ]]; then
+            echo "No JUMP_HOST_SSH_KEY secret - skipping jump host user deletion"
+            exit 0
+          fi
+
+          echo "## Jump Host User Deletion" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          IFS=',' read -ra USERS <<< "${{ inputs.users }}"
+
+          # Setup SSH key for jump host access
+          mkdir -p ~/.ssh
+          echo "$JUMP_HOST_SSH_KEY" > ~/.ssh/jump_host_key
+          chmod 600 ~/.ssh/jump_host_key
+
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/jump_host_key"
+
+          echo "| Username | Jump Host Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|------------------|" >> $GITHUB_STEP_SUMMARY
+
+          for user in "${USERS[@]}"; do
+            user=$(echo "$user" | xargs)
+            [[ -z "$user" ]] && continue
+
+            echo "Deleting jump host user: $user"
+
+            # Delete user on jump host via SSH
+            ssh $SSH_OPTS ${JUMP_HOST_USER}@${JUMP_HOST} "
+              sudo userdel -r '$user' 2>/dev/null || true
+            "
+
+            echo "| $user | Deleted |" >> $GITHUB_STEP_SUMMARY
+          done
+
+          # Cleanup
+          rm -f ~/.ssh/jump_host_key
+
+      - name: Final Status
+        run: |
+          echo ""
+          echo "=== Current HTPasswd Users ==="
+          if oc get secret $HTPASSWD_SECRET -n openshift-config &>/dev/null; then
+            oc get secret $HTPASSWD_SECRET -n openshift-config -o jsonpath='{.data.htpasswd}' | \
+              base64 -d | cut -d: -f1
+          else
+            echo "No HTPasswd secret configured"
+          fi
+
+          echo ""
+          echo "=== Workflow-Managed ClusterRoleBindings ==="
+          oc get clusterrolebindings -l managed-by=manage-cluster-users-workflow -o wide 2>/dev/null || \
+            echo "No workflow-managed bindings found"

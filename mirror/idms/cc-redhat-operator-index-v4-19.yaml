@@ -1,0 +1,19 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+apiVersion: olm.operatorframework.io/v1
+kind: ClusterCatalog
+metadata:
+  annotations:
+    createdAt: Sunday, 01-Feb-26 09:34:04 UTC
+    createdBy: oc-mirror v2
+    oc-mirror_version: 4.19.0-202511270155.p2.g5d64d29.assembly.stream.el9-5d64d29
+  name: cc-redhat-operator-index-v4-19
+spec:
+  priority: 0
+  source:
+    image:
+      ref: registry.example.com:5000/redhat/redhat-operator-index:v4.19
+    type: Image
+status: {}

@@ -1,0 +1,15 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+---
+# Ansible Galaxy requirements
+# Install with: ansible-galaxy collection install -r requirements.yml
+
+collections:
+  - name: community.general
+    version: "12.2.0"
+  - name: ansible.posix
+    version: "2.1.0"
+  - name: community.docker
+    version: "5.0.4"

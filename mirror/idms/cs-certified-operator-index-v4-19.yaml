@@ -1,0 +1,17 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  annotations:
+    createdAt: Sunday, 01-Feb-26 09:34:55 UTC
+    createdBy: oc-mirror v2
+    oc-mirror_version: 4.19.0-202511270155.p2.g5d64d29.assembly.stream.el9-5d64d29
+  name: cs-certified-operator-index-v4-19
+  namespace: openshift-marketplace
+spec:
+  image: registry.example.com:5000/redhat/certified-operator-index:v4.19
+  sourceType: grpc
+status: {}
