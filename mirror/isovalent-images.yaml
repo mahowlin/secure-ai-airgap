@@ -1,0 +1,44 @@
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  operators:
+  - catalog: registry.redhat.io/redhat/certified-operator-index:v4.19
+    packages:
+    - name: clife
+      defaultChannel: '1.19'
+      channels:
+      - name: '1.19'
+  - catalog: quay.io/isovalent/tetragon-operator-index:v0.0.1
+    packages:
+    - name: tetragon-operator
+      channels:
+      - name: v1.18
+  additionalImages:
+  - name: containers.isovalent.com/clife:v1.19.7-cee.3@sha256:9030cd40156f11115da0f0a5221efa0d6dda6e3d32cd63735ee94c7349496aae
+  - name: containers.isovalent.com/cilium-ubi:v1.19.7-cee.3@sha256:dfddee8e69d57bcaaa882d70d506f88e98c76fbf41198e3553a4d67cf9975228
+  - name: containers.isovalent.com/cilium-envoy-ubi:v1.19.7-cee.3@sha256:4b7a85313b8f113cc326506eab45f42d1fd9700cf82959ba00f747ad596a9235
+  - name: containers.isovalent.com/operator-generic-ubi:v1.19.7-cee.3@sha256:c0b7d6666c0b3357a6ea2b8a9b2a07d569b56349ce9fe845dd77e641c4059ed2
+  - name: containers.isovalent.com/hubble-relay-ubi:v1.19.7-cee.3@sha256:efb6dacdf56fac1ffe88c960f602bdcb336870986f2d762963a9922b5e23a742
+  - name: containers.isovalent.com/startup-script-ubi:v1.19.7-cee.3@sha256:53c1c703536f4b4bb4cc45a98e998bf148c83c64b922396ee95315a1d428c4ab
+  - name: containers.isovalent.com/hubble-timescape-lite-ubi:v1.19.5@sha256:32cad75c423d493e1218a1b171a458579af6af8e324097c86a107210dede2738
+  - name: containers.isovalent.com/cilium-clickhouse-server:v1.19.7-cee.3@sha256:8282545285f85be63ebf9e7f37cdc8ebfc7039ab40ec9987adaf053fd76797eb
+  - name: quay.io/isovalent/hubble-timescape:v1.18.1
+  - name: quay.io/isovalent/hubble-timescape:v1.18.2
+  - name: quay.io/isovalent/hubble-timescape-ui:v1.18.2
+  - name: quay.io/isovalent/hubble-k8s-exporter:v1.18.2
+  - name: quay.io/isovalent/hubble-k8s-exporter:v1.19.0-rc.2
+  - name: quay.io/isovalent/clickhouse-server:25.8.12.129-alpine
+  - name: quay.io/isovalent/certgen:v0.2.4
+  - name: quay.io/isovalent/vector:0.51.0-distroless-libc
+  - name: containers.isovalent.com/clife:v1.19.5-cee.1@sha256:f389f09f3adb832baef5f498097f49413da7fe75500beac783b6ea007c218046
+  - name: containers.isovalent.com/cilium:v1.19.5-cee.1@sha256:e6d4cc9b7305a37cb093f6058d6a8bc9a4daf62769150f2f50b67d8cbf348763
+  - name: containers.isovalent.com/cilium-envoy:v1.19.5-cee.1@sha256:767101fb8a5e38f055778cb43b7aa8eed80450b37f8121effac3d9de9e06dc99
+  - name: containers.isovalent.com/operator-generic:v1.19.5-cee.1@sha256:12e6f4db1456a320ec5853c36422c0eae5b47344bda0f2fc69c00672e8cf647c
+  - name: containers.isovalent.com/hubble-relay:v1.19.5-cee.1@sha256:0a6f3db184dfe50d049ebf72cb34a7846f74ecfb814c53109c1e225c0999f762
+  - name: containers.isovalent.com/cilium-ubi:v1.19.5-cee.1@sha256:73eba6a0a7dd467dc9733cf3ad68b425b6b1702d53c0bd0553ee3de8b2369040
+  - name: containers.isovalent.com/cilium-envoy-ubi:v1.19.5-cee.1@sha256:ef4fe3701412aa2f01705bb5e9a545424cb5ee9b5aa93df3e643738873c97d28
+  - name: containers.isovalent.com/operator-generic-ubi:v1.19.5-cee.1@sha256:912c84f7e07f3f28bf8cd3762a0e7d281d809d2726b0c38fe605e785c32ce0e9
+  - name: containers.isovalent.com/hubble-relay-ubi:v1.19.5-cee.1@sha256:9d3423ed3adda9d4c0a0c67fc6e8438058157fb7e4b029b000734c3826cf23e0
+  - name: containers.isovalent.com/startup-script-ubi:v1.19.5-cee.1@sha256:9f3a55ccf6c97e7ababd5027647f55df4a018a87bdf799c7902ec85737c8f9a5
+  - name: containers.isovalent.com/hubble-timescape-lite-ubi:v1.19.1@sha256:e52f4e8c50ca6be560d0f368d5dcfc79e7dd1e2a464867236b6e61b2cad02954
+  - name: containers.isovalent.com/cilium-clickhouse-server:v1.19.5-cee.1@sha256:f55a1dec22cea056abb32eccf4fad01d4561d8fad47f1c116801ec41f9ae2dc4

@@ -1,0 +1,43 @@
+name: Prepare selected operator inspection inputs
+description: Checksum-verified read-only acquisition or offline import; no registry writes or installation
+inputs:
+  contract:
+    description: Absolute selected Platform source contract path
+    required: true
+  output:
+    description: Absolute prepared input destination
+    required: true
+  source-root:
+    description: Optional offline prepared-artifact directory
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Prepare pinned read-only artifact client
+      if: inputs.source-root == ''
+      shell: bash
+      env:
+        CRANE_VERSION: 0.22.0
+        CRANE_ARCHIVE_SHA256: edb74d53fad9a596860f59d1c5d04a43dfb5f441dc71f57060dd0bf39483c833
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/operator-artifact-bin"
+        archive="$RUNNER_TEMP/operator-artifact-crane.tar.gz"
+        curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+          "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" --output "$archive"
+        echo "$CRANE_ARCHIVE_SHA256  $archive" | sha256sum --check --strict
+        tar -xzf "$archive" -C "$RUNNER_TEMP/operator-artifact-bin" crane
+        echo "$RUNNER_TEMP/operator-artifact-bin" >> "$GITHUB_PATH"
+    - name: Prepare and verify selected input bytes
+      shell: bash
+      env:
+        PREPARE_ACTION_PATH: ${{ github.action_path }}
+        OPERATOR_CONTRACT: ${{ inputs.contract }}
+        OPERATOR_OUTPUT: ${{ inputs.output }}
+        OPERATOR_SOURCE_ROOT: ${{ inputs.source-root }}
+      run: |
+        set -euo pipefail
+        source_args=(--fetch)
+        if test -n "$OPERATOR_SOURCE_ROOT"; then source_args=(--source-root "$OPERATOR_SOURCE_ROOT"); fi
+        python3 "$PREPARE_ACTION_PATH/../../../scripts/prepare-oc-mirror-artifacts.py" \
+          --contract "$OPERATOR_CONTRACT" --output "$OPERATOR_OUTPUT" "${source_args[@]}"

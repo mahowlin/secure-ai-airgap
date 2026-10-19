@@ -1,0 +1,32 @@
+apiVersion: config.openshift.io/v1
+kind: ImageTagMirrorSet
+metadata:
+  name: isovalent-example
+  annotations:
+    createdBy: sync-images workflow
+spec:
+  imageTagMirrors:
+  - mirrors:
+    - registry.example.com:5000/cilium-clickhouse-server
+    source: containers.isovalent.com/cilium-clickhouse-server
+  - mirrors:
+    - registry.example.com:5000/cilium-envoy-ubi
+    source: containers.isovalent.com/cilium-envoy-ubi
+  - mirrors:
+    - registry.example.com:5000/cilium-ubi
+    source: containers.isovalent.com/cilium-ubi
+  - mirrors:
+    - registry.example.com:5000/clife
+    source: containers.isovalent.com/clife
+  - mirrors:
+    - registry.example.com:5000/hubble-relay-ubi
+    source: containers.isovalent.com/hubble-relay-ubi
+  - mirrors:
+    - registry.example.com:5000/hubble-timescape-lite-ubi
+    source: containers.isovalent.com/hubble-timescape-lite-ubi
+  - mirrors:
+    - registry.example.com:5000/operator-generic-ubi
+    source: containers.isovalent.com/operator-generic-ubi
+  - mirrors:
+    - registry.example.com:5000/startup-script-ubi
+    source: containers.isovalent.com/startup-script-ubi

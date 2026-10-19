@@ -1,7 +1,3 @@
-# Copyright (c) 2026 Cisco and/or its affiliates.
-# Licensed under the Cisco Sample Code License, Version 1.1
-# See LICENSE in the project root.
-
 name: 'Sync Images'
 
 # Mirrors container images to local registry using parallel jobs
@@ -9,14 +5,17 @@ name: 'Sync Images'
 #
 # Usage:
 #   gh workflow run "Sync Images"                           # All jobs (parallel)
-#   gh workflow run "Sync Images" -f sync_target=other-images  # Just other-images
-#   gh workflow run "Sync Images" -f sync_target=platform      # Just platform
+#   gh workflow run "Sync Images" -f sync_target=other-images      # Just other-images
+#   gh workflow run "Sync Images" -f sync_target=portworx-images -f promote_scope=none
+#   gh workflow run "Sync Images" -f sync_target=isovalent-images  # Just Isovalent images
+#   gh workflow run "Sync Images" -f sync_target=platform          # Just platform
 #   gh workflow run "Sync Images" -f sync_target=redhat-operators  # Just RH operators
 #
-# Architecture: 3 parallel oc-mirror jobs for ~3x speedup
+# Architecture: 4 parallel oc-mirror jobs for speed and failure isolation
 # - sync-platform: OCP release images (~11 min)
 # - sync-redhat-ops: redhat-operator-index (~16 min)
-# - sync-other: certified + tetragon + additionalImages (~13 min)
+# - sync-isovalent: CLIFE, Tetragon, Hubble Timescape, Vector
+# - sync-other: NVIDIA, support tools, demo images (~13 min)
 # Total wall time: ~16-20 min (vs ~50 min sequential)
 
 on:
@@ -26,6 +25,22 @@ on:
 
   workflow_dispatch:
     inputs:
+      environment:
+        description: 'Explicit environments/<name> execution profile'
+        required: true
+        type: string
+      project_contract:
+        description: 'Optional generated metadata.yaml staged by the owning pipeline'
+        required: false
+        type: string
+      hcp_cache_contract:
+        description: 'Staged non-secret selected-cache contract JSON (hcp-cache only)'
+        required: false
+        type: string
+      hcp_cache_ca_file:
+        description: 'Staged public CA matching the selected-cache trust hash, if additional-ca'
+        required: false
+        type: string
       sync_target:
         description: 'What to sync (default: all)'
         required: false
@@ -34,34 +49,275 @@ on:
           - all
           - platform
           - redhat-operators
+          - isovalent-images
           - other-images
+          - portworx-images
+          - hcp-cache
         default: all
-
+      promote_scope:
+        description: 'Bundle scope to promote after a validated sync'
+        required: false
+        type: choice
+        options:
+          - all
+          - none
+          - ocp-install-core
+          - cilium-day1
+          - gitops-bootstrap
+          - platform-day2
+        default: all
+      platform_day2_profile:
+        description: 'Platform Day 2 compatibility profile alias to publish when promoting platform-day2 (for example: ocp-4.19-cilium-1.18)'
+        required: false
+        type: string
+      inspect_isovalent_release:
+        description: 'Read authenticated IEP metadata only; do not mirror or promote'
+        required: false
+        type: boolean
+        default: false
+      inspect_clife_version:
+        description: 'Optional CLIFE archive version to inspect with the existing authenticated inspection job'
+        required: false
+        type: string
+      validate_only:
+        description: 'Validate a bounded image target without writing to the registry'
+        required: false
+        type: boolean
+        default: false
   workflow_call:
+    inputs:
+      environment:
+        description: 'Explicit environments/<name> execution profile'
+        required: true
+        type: string
+      project_contract:
+        description: 'Optional generated metadata.yaml staged by the owning pipeline'
+        required: false
+        type: string
+      hcp_cache_contract:
+        description: 'Staged non-secret selected-cache contract JSON (hcp-cache only)'
+        required: false
+        type: string
+      hcp_cache_ca_file:
+        description: 'Staged public CA matching the selected-cache trust hash, if additional-ca'
+        required: false
+        type: string
+      sync_target:
+        description: 'What to sync (default: all)'
+        required: false
+        type: string
+        default: all
+      promote_scope:
+        description: 'Bundle scope to promote after a validated sync'
+        required: false
+        type: string
+        default: all
+      platform_day2_profile:
+        description: 'Platform Day 2 compatibility profile alias to publish when promoting platform-day2 (for example: ocp-4.19-cilium-1.18)'
+        required: false
+        type: string
+        default: ''
+      inspect_isovalent_release:
+        description: 'Read authenticated IEP metadata only; do not mirror or promote'
+        required: false
+        type: boolean
+        default: false
+      inspect_clife_version:
+        description: 'Optional CLIFE archive version to inspect'
+        required: false
+        type: string
+        default: ''
+      validate_only:
+        description: 'Validate a bounded image target without writing to the registry'
+        required: false
+        type: boolean
+        default: false
     secrets:
+      HCP_CACHE_SOURCE_AUTH:
+        required: false
       REDHAT_PULL_SECRET:
         required: true
+      ISOVALENT_REGISTRY_TOKEN:
+        required: false
+      NVIDIA_NGC_API_KEY:
+        required: false
+      GAR_READER_KEY:
+        required: false
 
 permissions:
   contents: write
 
 env:
-  LOCAL_REGISTRY: ${{ vars.OCP_REGISTRY_URL }}
+  PROFILE_NAME: ${{ inputs.environment }}
+  PROJECT_CONTRACT: ${{ inputs.project_contract }}
+  LEGACY_REGISTRY_OVERRIDE: ${{ vars.OCP_REGISTRY_URL }}
+  PLATFORM_DAY2_PROFILE: ${{ inputs.platform_day2_profile }}
 
 jobs:
+  #----------------------------------------------------------------------------
+  # Preflight: reject invalid sync/promotion combinations before mirror work
+  #----------------------------------------------------------------------------
+  validate-inputs:
+    name: 'Validate Inputs'
+    outputs:
+      registry: ${{ steps.contract.outputs.registry }}
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    steps:
+    - uses: actions/checkout@v4
+    - name: Resolve canonical destination and reject conflicts before writes
+      id: contract
+      run: |
+        set -euo pipefail
+        python3 scripts/read-registry-contract.py --output "$GITHUB_OUTPUT" --selection mirror/isovalent-selection.yaml
+    - name: Validate sync target and promotion scope
+      shell: bash
+      run: |
+        set -euo pipefail
+        sync_target="${{ inputs.sync_target || 'all' }}"
+        promote_scope="${{ inputs.promote_scope || 'all' }}"
+        platform_day2_profile="${{ inputs.platform_day2_profile }}"
+        inspect_isovalent_release="${{ inputs.inspect_isovalent_release || false }}"
+        inspect_clife_version="${{ inputs.inspect_clife_version }}"
+        validate_only="${{ inputs.validate_only || false }}"
+
+        if [ "$inspect_isovalent_release" = "true" ] && { [ "$sync_target" != "isovalent-images" ] || [ "$promote_scope" != "none" ]; }; then
+          echo "::error::inspect_isovalent_release requires sync_target=isovalent-images and promote_scope=none"
+          exit 2
+        fi
+        if [ -n "$inspect_clife_version" ] && { [ "$inspect_isovalent_release" != "true" ] || [[ ! "$inspect_clife_version" =~ ^1\.[0-9]+\.[0-9]+$ ]]; }; then
+          echo "::error::inspect_clife_version requires metadata-only inspection and a major.minor.patch version"
+          exit 2
+        fi
+
+        if [ "$validate_only" = "true" ] && { { [ "$sync_target" != "portworx-images" ] && [ "$sync_target" != "hcp-cache" ]; } || [ "$promote_scope" != "none" ]; }; then
+          echo "::error::validate_only requires sync_target=portworx-images or hcp-cache and promote_scope=none"
+          exit 2
+        fi
+
+        if [ -n "$platform_day2_profile" ] && [[ ! "$platform_day2_profile" =~ ^ocp-[0-9]+\.[0-9]+-cilium-[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::platform_day2_profile must match ocp-x.y-cilium-x.y, got: $platform_day2_profile"
+          exit 2
+        fi
+
+        if [ "$sync_target" = hcp-cache ]; then
+          test "$promote_scope" = none
+          test -n "${{ inputs.hcp_cache_contract }}"
+        fi
+        case "$sync_target" in all|platform|redhat-operators|isovalent-images|other-images|portworx-images|hcp-cache) ;; *) exit 2 ;; esac
+        case "$promote_scope:$sync_target" in
+          none:*) ;;
+          all:all) ;;
+          ocp-install-core:all|ocp-install-core:platform) ;;
+          cilium-day1:all|cilium-day1:isovalent-images) ;;
+          gitops-bootstrap:all|gitops-bootstrap:redhat-operators) ;;
+          platform-day2:all|platform-day2:isovalent-images|platform-day2:redhat-operators) ;;
+          *)
+            printf '%s\n' \
+              "Invalid sync-images input combination: sync_target=$sync_target promote_scope=$promote_scope" \
+              "" \
+              "Promotion scopes require the sync jobs that feed their bundle:" \
+              "- promote_scope=none: any sync_target" \
+              "- promote_scope=all: sync_target=all" \
+              "- promote_scope=ocp-install-core: sync_target=all or platform" \
+              "- promote_scope=cilium-day1: sync_target=all or isovalent-images" \
+              "- promote_scope=gitops-bootstrap: sync_target=all or redhat-operators" \
+              "- promote_scope=platform-day2: sync_target=all, isovalent-images, or redhat-operators" \
+              "" \
+              "platform-day2 is a composite Day 2 bundle (Red Hat operators + Isovalent + other/NVIDIA/demo images)." \
+              "Partial Isovalent promotion composes the new Isovalent mirror policy with the current platform-day2 bundle." >&2
+            exit 2
+            ;;
+        esac
+
+        if [ "$promote_scope" = "all" ] || [ "$promote_scope" = "platform-day2" ]; then
+          if [ -z "$platform_day2_profile" ]; then
+            echo "::error::platform_day2_profile is required when promoting platform-day2 so the OCI chart alias can match SAIF intent."
+            exit 2
+          fi
+        fi
+
+        echo "Validated sync_target=$sync_target promote_scope=$promote_scope platform_day2_profile=${platform_day2_profile:-none} inspect_isovalent_release=$inspect_isovalent_release validate_only=$validate_only" >> "$GITHUB_STEP_SUMMARY"
+
+  #----------------------------------------------------------------------------
+  # Metadata-only authenticated discovery. This never writes to either registry.
+  #----------------------------------------------------------------------------
+  inspect-isovalent-release:
+    needs: [validate-inputs]
+    name: 'Inspect IEP 26.05 Release'
+    if: ${{ inputs.inspect_isovalent_release }}
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    permissions:
+      contents: read
+    env:
+      ISOVALENT_REGISTRY_USERNAME: ${{ vars.ISOVALENT_REGISTRY_USERNAME }}
+      ISOVALENT_REGISTRY_TOKEN: ${{ secrets.ISOVALENT_REGISTRY_TOKEN }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Discover authenticated release metadata
+      shell: bash
+      env:
+        CLIFE_VERSION: ${{ inputs.inspect_clife_version }}
+      run: |
+        set -euo pipefail
+        if [ -n "$CLIFE_VERSION" ]; then
+          python3 - <<'PY'
+        import os
+        import yaml
+        version = os.environ['CLIFE_VERSION']
+        contract = yaml.safe_load(open('mirror/releases/iep-26.05.yaml'))
+        contract['clifeBundle']['url'] = (
+            'https://artifactory.isovalent.com/artifactory/archive/clife-manifests/'
+            f'clife-v{version}.tar.gz'
+        )
+        contract['clifeBundle']['sha256'] = ''
+        with open(os.path.join(os.environ['RUNNER_TEMP'], 'clife-candidate.yaml'), 'w') as stream:
+            yaml.safe_dump(contract, stream)
+        PY
+          python3 scripts/inspect-isovalent-release.py \
+            --contract "$RUNNER_TEMP/clife-candidate.yaml" \
+            --output "$RUNNER_TEMP/iep-26.05-discovery.json" \
+            --discovery-only --bundle-only
+        else
+          python3 scripts/inspect-isovalent-release.py \
+            --selection mirror/isovalent-selection.yaml \
+            --output "$RUNNER_TEMP/iep-26.05-discovery.json"
+        fi
+
+    - name: Upload metadata-only evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: iep-26.05-release-discovery
+        path: ${{ runner.temp }}/iep-26.05-discovery.json
+        if-no-files-found: error
+
   #----------------------------------------------------------------------------
   # Job 1: Platform Images (OCP Release)
   #----------------------------------------------------------------------------
   sync-platform:
+    needs: [validate-inputs]
     name: 'Platform Images'
-    if: ${{ inputs.sync_target == 'all' || inputs.sync_target == 'platform' || inputs.sync_target == '' }}
-    runs-on: [self-hosted, linux, saif-github-runner]
+    if: ${{ !inputs.inspect_isovalent_release && (inputs.sync_target == 'all' || inputs.sync_target == 'platform' || inputs.sync_target == '') }}
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+
+    - name: Resolve selected registry input
+      run: |
+        set -euo pipefail
+        registry_output=$(mktemp "$RUNNER_TEMP/registry-output.XXXXXX")
+        trap 'rm -f -- "$registry_output"' EXIT
+        python3 scripts/read-registry-contract.py --output "$registry_output" --selection mirror/isovalent-selection.yaml
+        sed 's/^registry=/LOCAL_REGISTRY=/' "$registry_output" >> "$GITHUB_ENV"
 
     - name: Configure Registry Auth
       run: |
@@ -101,15 +357,24 @@ jobs:
   # Job 2: Red Hat Operators (heaviest catalog)
   #----------------------------------------------------------------------------
   sync-redhat-ops:
+    needs: [validate-inputs]
     name: 'Red Hat Operators'
-    if: ${{ inputs.sync_target == 'all' || inputs.sync_target == 'redhat-operators' || inputs.sync_target == '' }}
-    runs-on: [self-hosted, linux, saif-github-runner]
+    if: ${{ !inputs.inspect_isovalent_release && (inputs.sync_target == 'all' || inputs.sync_target == 'redhat-operators' || inputs.sync_target == '') }}
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+
+    - name: Resolve selected registry input
+      run: |
+        set -euo pipefail
+        registry_output=$(mktemp "$RUNNER_TEMP/registry-output.XXXXXX")
+        trap 'rm -f -- "$registry_output"' EXIT
+        python3 scripts/read-registry-contract.py --output "$registry_output" --selection mirror/isovalent-selection.yaml
+        sed 's/^registry=/LOCAL_REGISTRY=/' "$registry_output" >> "$GITHUB_ENV"
 
     - name: Configure Registry Auth
       run: |
@@ -138,6 +403,16 @@ jobs:
           exit 1
         fi
 
+    - name: Generate Red Hat Day 2 Mirror Policy
+      run: |
+        scripts/generate-mirror-policy.py \
+          --config mirror/redhat-operators.yaml \
+          --source-config mirror/mirror-policy-sources.yaml \
+          --local-registry "$LOCAL_REGISTRY" \
+          --name redhat-day2-images \
+          --output-dir oc-mirror-workspace/working-dir/cluster-resources \
+          --kinds ImageDigestMirrorSet
+
     - name: Upload IDMS Artifacts
       uses: actions/upload-artifact@v4
       with:
@@ -146,21 +421,166 @@ jobs:
         if-no-files-found: ignore
 
   #----------------------------------------------------------------------------
-  # Job 3: Certified/Tetragon Operators + Additional Images
+  # Job 3: Isovalent Images (CLIFE, Tetragon, Hubble Timescape)
   #----------------------------------------------------------------------------
-  sync-other:
-    name: 'Other Images'
-    if: ${{ inputs.sync_target == 'all' || inputs.sync_target == 'other-images' || inputs.sync_target == '' }}
-    runs-on: [self-hosted, linux, saif-github-runner]
+  sync-isovalent:
+    needs: [validate-inputs]
+    name: 'Isovalent Images'
+    if: ${{ !inputs.inspect_isovalent_release && (inputs.sync_target == 'all' || inputs.sync_target == 'isovalent-images' || inputs.sync_target == '') }}
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     env:
-      NVIDIA_NGC_API_KEY: ${{ secrets.NVIDIA_NGC_API_KEY }}
+      REDHAT_PULL_SECRET: ${{ secrets.REDHAT_PULL_SECRET }}
+      ISOVALENT_REGISTRY_USERNAME: ${{ vars.ISOVALENT_REGISTRY_USERNAME }}
+      ISOVALENT_REGISTRY_TOKEN: ${{ secrets.ISOVALENT_REGISTRY_TOKEN }}
 
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+
+    - name: Resolve selected registry input
+      run: |
+        set -euo pipefail
+        registry_output=$(mktemp "$RUNNER_TEMP/registry-output.XXXXXX")
+        trap 'rm -f -- "$registry_output"' EXIT
+        python3 scripts/read-registry-contract.py --output "$registry_output" --selection mirror/isovalent-selection.yaml
+        sed 's/^registry=/LOCAL_REGISTRY=/' "$registry_output" >> "$GITHUB_ENV"
+
+    - name: Resolve selected Isovalent recipe and release inputs
+      id: selected
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/inspect-isovalent-release.py \
+          --selection mirror/isovalent-selection.yaml --selection-only \
+          --output "$RUNNER_TEMP/isovalent-selection.json"
+        python3 - <<'PYTHON'
+        import json, os
+        value=json.load(open(os.path.join(os.environ['RUNNER_TEMP'],'isovalent-selection.json')))
+        with open(os.environ['GITHUB_OUTPUT'],'a') as stream:
+            stream.write('image_set='+value['imageSet']+'\n')
+            stream.write('registry='+value['destination']['registry']+'\n')
+        PYTHON
+
+    - name: Verify authenticated selected Isovalent release inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/inspect-isovalent-release.py \
+          --selection mirror/isovalent-selection.yaml \
+          --output "$RUNNER_TEMP/isovalent-source-verified.json"
+
+    - name: Configure Registry Auth
+      shell: bash
+      run: |
+        set -euo pipefail
+        command -v skopeo >/dev/null
+        python3 scripts/prepare-isovalent-auth.py \
+          --selection mirror/isovalent-selection.yaml --output-root "$RUNNER_TEMP" \
+          --github-env "$GITHUB_ENV" --expected-registry "$LOCAL_REGISTRY"
+
+    - name: Mirror Isovalent Images
+      shell: bash
+      env:
+        IMAGE_SET: ${{ steps.selected.outputs.image_set }}
+        LOCAL_REGISTRY: ${{ steps.selected.outputs.registry }}
+      run: |
+        set -euo pipefail
+        echo "Mirroring Isovalent images to $LOCAL_REGISTRY..."
+        oc-mirror --v2 --config "$IMAGE_SET" \
+          docker://$LOCAL_REGISTRY \
+          --workspace file://$GITHUB_WORKSPACE/oc-mirror-workspace \
+          --dest-tls-verify=true \
+          --parallel-images 2 \
+          --parallel-layers 3 \
+          --retry-times 3 \
+          --image-timeout 120m 2>&1 | tee "$RUNNER_TEMP/isovalent-mirror.log"
+
+        if grep -q '\[ERROR\]' "$RUNNER_TEMP/isovalent-mirror.log"; then
+          echo "::error::oc-mirror reported errors"
+          grep '\[ERROR\]' "$RUNNER_TEMP/isovalent-mirror.log"
+          exit 1
+        fi
+
+    - name: Verify mirrored selected Isovalent image digests
+      env:
+        LOCAL_REGISTRY: ${{ steps.selected.outputs.registry }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        scripts/verify-isovalent-mirror.py \
+          --selection mirror/isovalent-selection.yaml \
+          --registry "https://$LOCAL_REGISTRY" \
+          --auth-file "$REGISTRY_AUTH_FILE" \
+          --cert-dir "$ISOVALENT_CERT_DIR" \
+          --output "$RUNNER_TEMP/isovalent-mirror-verified.json"
+
+    - name: Generate Isovalent Mirror Policy
+      env:
+        IMAGE_SET: ${{ steps.selected.outputs.image_set }}
+        LOCAL_REGISTRY: ${{ steps.selected.outputs.registry }}
+      run: |
+        scripts/generate-mirror-policy.py \
+          --config "$IMAGE_SET" \
+          --source-config mirror/mirror-policy-sources.yaml \
+          --local-registry "$LOCAL_REGISTRY" \
+          --name isovalent-images \
+          --output-dir oc-mirror-workspace/working-dir/cluster-resources
+
+    - name: Upload IDMS Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: idms-isovalent
+        path: oc-mirror-workspace/working-dir/cluster-resources/*.yaml
+        if-no-files-found: ignore
+
+    - name: Upload verified release evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: isovalent-selection-verified
+        path: |
+          ${{ runner.temp }}/isovalent-selection.json
+          ${{ runner.temp }}/isovalent-source-verified.json
+          ${{ runner.temp }}/isovalent-mirror-verified.json
+        if-no-files-found: error
+
+    - name: Remove temporary registry credentials and trust configuration
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -n "${ISOVALENT_AUTH_DIR:-}" ]; then
+          rm -rf -- "$ISOVALENT_AUTH_DIR"
+        fi
+
+  #----------------------------------------------------------------------------
+  # Job 4: Other Images (NVIDIA, support tools, demo images)
+  #----------------------------------------------------------------------------
+  sync-other:
+    needs: [validate-inputs]
+    name: 'Other Images'
+    if: ${{ !inputs.inspect_isovalent_release && (inputs.sync_target == 'all' || inputs.sync_target == 'other-images' || inputs.sync_target == '') }}
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+
+    env:
+      NVIDIA_NGC_API_KEY: ${{ secrets.NVIDIA_NGC_API_KEY }}
+      GAR_READER_KEY: ${{ secrets.GAR_READER_KEY }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Resolve selected registry input
+      run: |
+        set -euo pipefail
+        registry_output=$(mktemp "$RUNNER_TEMP/registry-output.XXXXXX")
+        trap 'rm -f -- "$registry_output"' EXIT
+        python3 scripts/read-registry-contract.py --output "$registry_output" --selection mirror/isovalent-selection.yaml
+        sed 's/^registry=/LOCAL_REGISTRY=/' "$registry_output" >> "$GITHUB_ENV"
 
     - name: Configure Registry Auth
       run: |
@@ -173,6 +593,15 @@ jobs:
           NVIDIA_AUTH=$(echo -n '$oauthtoken:'"$NVIDIA_NGC_API_KEY" | base64 -w 0)
           jq --arg auth "$NVIDIA_AUTH" \
             '.auths["nvcr.io"] = {"auth": $auth}' \
+            ~/.docker/config.json > ~/.docker/config.json.tmp
+          mv ~/.docker/config.json.tmp ~/.docker/config.json
+        fi
+
+        if [ -n "$GAR_READER_KEY" ]; then
+          echo "Adding Google Artifact Registry authentication..."
+          GAR_AUTH=$(printf '_json_key:%s' "$GAR_READER_KEY" | base64 -w 0)
+          jq --arg auth "$GAR_AUTH" \
+            '.auths["us-docker.pkg.dev"] = {"auth": $auth}' \
             ~/.docker/config.json > ~/.docker/config.json.tmp
           mv ~/.docker/config.json.tmp ~/.docker/config.json
         fi
@@ -200,67 +629,15 @@ jobs:
           exit 1
         fi
 
-    - name: Generate Custom IDMS
+    - name: Generate Custom Mirror Policy
       run: |
-        # Generate IDMS for images that oc-mirror doesn't cover
-        # oc-mirror only generates IDMS for registry.redhat.io sources
-        mkdir -p oc-mirror-workspace/working-dir/cluster-resources
-
-        # NVIDIA images from docker.io, nvcr.io, and registry.connect.redhat.com
-        cat > oc-mirror-workspace/working-dir/cluster-resources/idms-nvidia.yaml << 'EOF'
-        apiVersion: config.openshift.io/v1
-        kind: ImageDigestMirrorSet
-        metadata:
-          name: nvidia-images
-          annotations:
-            createdBy: sync-images workflow
-        spec:
-          imageDigestMirrors:
-            - mirrors:
-                - registry.example.com:5000/nvidia
-              source: docker.io/nvidia
-            - mirrors:
-                - registry.example.com:5000/nvidia
-              source: nvcr.io/nvidia
-            - mirrors:
-                - registry.example.com:5000/nvidia
-              source: registry.connect.redhat.com/nvidia
-        EOF
-        echo "Generated NVIDIA IDMS"
-
-        # Isovalent images from quay.io
-        cat > oc-mirror-workspace/working-dir/cluster-resources/idms-isovalent.yaml << 'EOF'
-        apiVersion: config.openshift.io/v1
-        kind: ImageDigestMirrorSet
-        metadata:
-          name: isovalent-images
-          annotations:
-            createdBy: sync-images workflow
-        spec:
-          imageDigestMirrors:
-            - mirrors:
-                - registry.example.com:5000/isovalent
-              source: quay.io/isovalent
-        EOF
-        echo "Generated Isovalent IDMS"
-
-        # OpenShift 4 images from registry.redhat.io
-        # oc-mirror generates openshift4 in ITMS (tag-based) but not IDMS (digest-based)
-        # OLM pulls operator images by digest for security, so IDMS is required
-        cat > oc-mirror-workspace/working-dir/cluster-resources/idms-openshift4.yaml << 'EOF'
-        apiVersion: config.openshift.io/v1
-        kind: ImageDigestMirrorSet
-        metadata:
-          name: openshift4-images
-          annotations:
-            createdBy: sync-images workflow
-        spec:
-          imageDigestMirrors:
-            - mirrors:
-                - registry.example.com:5000/openshift4
-              source: registry.redhat.io/openshift4
-        EOF
-        echo "Generated OpenShift4 IDMS"
+        scripts/generate-mirror-policy.py \
+          --config mirror/other-images.yaml \
+          --source-config mirror/mirror-policy-sources.yaml \
+          --local-registry "$LOCAL_REGISTRY" \
+          --name other-images \
+          --output-dir oc-mirror-workspace/working-dir/cluster-resources \
+          --kinds ImageDigestMirrorSet
 
     - name: Upload IDMS Artifacts
       uses: actions/upload-artifact@v4
@@ -270,13 +647,80 @@ jobs:
         if-no-files-found: ignore
 
   #----------------------------------------------------------------------------
-  # Combine: Merge all IDMS artifacts and commit to repo
+  # Bounded Portworx Enterprise air-gap closure
   #----------------------------------------------------------------------------
-  combine-idms:
-    name: 'Combine IDMS'
-    runs-on: [self-hosted, linux, saif-github-runner]
-    needs: [sync-platform, sync-redhat-ops, sync-other]
-    if: always()
+  sync-portworx:
+    needs: [validate-inputs]
+    name: 'Portworx Images'
+    if: ${{ !inputs.inspect_isovalent_release && (inputs.sync_target == 'all' || inputs.sync_target == 'portworx-images') }}
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Resolve selected registry input
+      run: |
+        set -euo pipefail
+        registry_output=$(mktemp "$RUNNER_TEMP/registry-output.XXXXXX")
+        trap 'rm -f -- "$registry_output"' EXIT
+        python3 scripts/read-registry-contract.py --output "$registry_output" --selection mirror/isovalent-selection.yaml
+        sed 's/^registry=/LOCAL_REGISTRY=/' "$registry_output" >> "$GITHUB_ENV"
+
+    - name: Validate exact Portworx inventory
+      run: scripts/validate-portworx-images.py --config mirror/portworx-images.yaml
+
+    - name: Configure Registry Auth
+      if: ${{ !inputs.validate_only }}
+      run: |
+        mkdir -p ~/.docker
+        echo '${{ secrets.REDHAT_PULL_SECRET }}' > ~/.docker/config.json
+        chmod 600 ~/.docker/config.json
+
+    - name: Mirror Portworx Images
+      if: ${{ !inputs.validate_only }}
+      working-directory: mirror
+      shell: bash
+      run: |
+        set -o pipefail
+        echo "Mirroring Portworx images to $LOCAL_REGISTRY..."
+        oc-mirror --v2 --config portworx-images.yaml \
+          docker://$LOCAL_REGISTRY \
+          --workspace file://$GITHUB_WORKSPACE/oc-mirror-workspace \
+          --dest-tls-verify=false \
+          --parallel-images 2 \
+          --parallel-layers 3 \
+          --retry-times 3 \
+          --image-timeout 120m 2>&1 | tee mirror.log
+
+        if grep -q '\[ERROR\]' mirror.log; then
+          echo "::error::oc-mirror reported errors"
+          grep '\[ERROR\]' mirror.log
+          exit 1
+        fi
+
+    - name: Upload mirror evidence
+      if: ${{ !inputs.validate_only }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: portworx-mirror-evidence
+        path: |
+          mirror/mirror.log
+          oc-mirror-workspace/working-dir/cluster-resources/*.yaml
+        if-no-files-found: warn
+
+  #----------------------------------------------------------------------------
+  # Promote: validate and publish scoped immutable image-policy bundles
+  #----------------------------------------------------------------------------
+  promote-bundles:
+    name: 'Promote Image Policy Bundles'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    needs: [sync-platform, sync-redhat-ops, sync-isovalent, sync-other, sync-portworx]
+    if: ${{ always() && !cancelled() && !inputs.inspect_isovalent_release && (inputs.promote_scope == 'all' || inputs.promote_scope == 'ocp-install-core' || inputs.promote_scope == 'cilium-day1' || inputs.promote_scope == 'gitops-bootstrap' || inputs.promote_scope == 'platform-day2') }}
 
     steps:
     - name: Checkout
@@ -284,156 +728,331 @@ jobs:
       with:
         ref: ${{ github.ref }}
 
-    - name: Download All Artifacts
+    - name: Resolve selected registry input
+      run: |
+        set -euo pipefail
+        registry_output=$(mktemp "$RUNNER_TEMP/registry-output.XXXXXX")
+        trap 'rm -f -- "$registry_output"' EXIT
+        python3 scripts/read-registry-contract.py --output "$registry_output" --selection mirror/isovalent-selection.yaml
+        sed 's/^registry=/LOCAL_REGISTRY=/' "$registry_output" >> "$GITHUB_ENV"
+
+    - name: Download IDMS Artifacts
       uses: actions/download-artifact@v4
       with:
         path: idms-download
         pattern: idms-*
         merge-multiple: true
 
-    - name: Update IDMS in Repository
+    - name: Promote Scoped Bundles
+      shell: bash
       run: |
-        echo "## Combined IDMS Manifests" >> $GITHUB_STEP_SUMMARY
+        set -euo pipefail
+        echo "## Image Policy Bundle Promotion" >> $GITHUB_STEP_SUMMARY
+        PROMOTE_SCOPE="${{ inputs.promote_scope || 'all' }}"
+        SYNC_TARGET="${{ inputs.sync_target || 'all' }}"
+        RESULTS='${{ toJson(needs) }}'
+        python3 - "$RESULTS" <<'PY'
+        import json
+        import sys
+        failed = {
+            name: data.get('result')
+            for name, data in json.loads(sys.argv[1]).items()
+            if data.get('result') not in ('success', 'skipped')
+        }
+        if failed:
+            raise SystemExit(f"upstream sync jobs failed; refusing promotion: {failed}")
+        PY
 
-        # Create generated IDMS directory
-        mkdir -p mirror/idms
-
-        # Copy downloaded IDMS files to repo (preserving existing static IDMS)
-        if ls idms-download/*.yaml 1>/dev/null 2>&1; then
-          cp idms-download/*.yaml mirror/idms/
-          echo "Copied IDMS files to mirror/idms/" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          ls -la mirror/idms/ >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+        if [ "$PROMOTE_SCOPE" = "all" ]; then
+          if [ "$SYNC_TARGET" != "all" ] && [ "$SYNC_TARGET" != "" ]; then
+            echo "::error::Partial syncs must select one explicit promote_scope or none; refusing full bundle promotion."
+            exit 1
+          fi
+          SCOPES="ocp-install-core cilium-day1 gitops-bootstrap platform-day2"
         else
-          echo "⚠️ No IDMS files found in artifacts" >> $GITHUB_STEP_SUMMARY
+          SCOPES="$PROMOTE_SCOPE"
         fi
 
-    - name: Commit IDMS to Repository
+        for scope in $SCOPES; do
+          PROFILE_ARG=()
+          if [ "$scope" = "platform-day2" ] && [ -n "${PLATFORM_DAY2_PROFILE:-}" ]; then
+            PROFILE_ARG=(--profile "$PLATFORM_DAY2_PROFILE")
+          fi
+          PARTIAL_ARG=()
+          if [ "$scope" = "platform-day2" ] && { [ "$SYNC_TARGET" = "isovalent-images" ] || [ "$SYNC_TARGET" = "redhat-operators" ]; }; then
+            PARTIAL_ARG=(--allow-partial --base-current-bundle)
+          fi
+          scripts/promote-image-policy-bundle.py \
+            --scope "$scope" \
+            --artifact-dir idms-download \
+            --registry "$LOCAL_REGISTRY" \
+            --sync-target "$SYNC_TARGET" \
+            --run-id "${{ github.run_id }}" \
+            --workflow "${{ github.workflow }}" \
+            "${PROFILE_ARG[@]}" \
+            "${PARTIAL_ARG[@]}"
+          echo "- promoted \`$scope\`" >> $GITHUB_STEP_SUMMARY
+        done
+
+    - name: Commit Promoted Bundles
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
 
-        git add mirror/idms/
+        git add mirror/bundles/
 
         if git diff --staged --quiet; then
-          echo "ℹ️ No IDMS changes to commit" >> $GITHUB_STEP_SUMMARY
+          echo "ℹ️ No bundle changes to commit" >> $GITHUB_STEP_SUMMARY
         else
-          git commit -m "Update IDMS manifests from sync-images run ${{ github.run_id }}"
-
-          # Retry push with rebase if race condition
+          git commit -m "Promote image policy bundles from sync-images run ${{ github.run_id }}"
           MAX_RETRIES=3
           for i in $(seq 1 $MAX_RETRIES); do
             if git push; then
-              echo "✅ IDMS committed to repository" >> $GITHUB_STEP_SUMMARY
+              echo "✅ Promoted bundles committed to repository" >> $GITHUB_STEP_SUMMARY
               break
+            fi
+            if [ $i -lt $MAX_RETRIES ]; then
+              echo "Push failed (attempt $i/$MAX_RETRIES), rebasing..."
+              git pull --rebase
             else
-              if [ $i -lt $MAX_RETRIES ]; then
-                echo "Push failed (attempt $i/$MAX_RETRIES), rebasing..."
-                git pull --rebase
-              else
-                echo "❌ Failed to push after $MAX_RETRIES attempts" >> $GITHUB_STEP_SUMMARY
-                exit 1
-              fi
+              echo "❌ Failed to push after $MAX_RETRIES attempts" >> $GITHUB_STEP_SUMMARY
+              exit 1
             fi
           done
         fi
 
-    - name: Upload Combined IDMS (backup artifact)
+    - name: Upload Bundle Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: idms-manifests
-        path: mirror/idms/*.yaml
+        name: image-policy-bundles
+        path: mirror/bundles/**
         if-no-files-found: warn
 
   #----------------------------------------------------------------------------
-  # Package IDMS as OCI Helm Chart
+  # Package platform-day2 bundle as OCI Helm Chart for GitOps consumption
   #----------------------------------------------------------------------------
   package-oci:
-    name: 'Package OCI Chart'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    name: 'Package platform-day2 OCI Chart'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
-    needs: [combine-idms]
-    if: needs.combine-idms.result == 'success'
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    needs: [promote-bundles]
+    if: ${{ always() && !cancelled() && needs.promote-bundles.result == 'success' && (inputs.promote_scope == 'all' || inputs.promote_scope == 'platform-day2') }}
 
+    env:
+      REDHAT_PULL_SECRET: ${{ secrets.REDHAT_PULL_SECRET }}
+      ISOVALENT_REGISTRY_USERNAME: ${{ vars.ISOVALENT_REGISTRY_USERNAME }}
+      ISOVALENT_REGISTRY_TOKEN: ${{ secrets.ISOVALENT_REGISTRY_TOKEN }}
     steps:
     - name: Checkout
       uses: actions/checkout@v4
       with:
         ref: ${{ github.ref }}
 
-    - name: Pull Latest (get IDMS from combine-idms commit)
+    - name: Resolve selected registry input
+      run: |
+        set -euo pipefail
+        registry_output=$(mktemp "$RUNNER_TEMP/registry-output.XXXXXX")
+        trap 'rm -f -- "$registry_output"' EXIT
+        python3 scripts/read-registry-contract.py --output "$registry_output" --selection mirror/isovalent-selection.yaml
+        sed 's/^registry=/LOCAL_REGISTRY=/' "$registry_output" >> "$GITHUB_ENV"
+
+    - name: Pull Latest Promoted Bundles
       run: |
         git pull origin ${{ github.ref_name }}
 
     - name: Prepare Chart
+      shell: bash
       run: |
-        # Copy IDMS/ITMS files to chart templates (exclude CatalogSources)
-        echo "Copying IDMS/ITMS to chart templates..."
-        for file in mirror/idms/idms-*.yaml mirror/idms/itms-*.yaml; do
-          if [ -f "$file" ]; then
-            cp "$file" charts/platform-idms/templates/
-            echo "  Copied: $(basename $file)"
-          fi
-        done
+        set -euo pipefail
+        rm -f charts/platform-idms/templates/*.yaml
+        CURRENT_JSON="mirror/bundles/platform-day2/current.json"
+        if [ ! -f "$CURRENT_JSON" ]; then
+          echo "::error::platform-day2 bundle ref not found: $CURRENT_JSON"
+          exit 1
+        fi
+        BUNDLE_PATH=$(python3 -c "import json; print(json.load(open('mirror/bundles/platform-day2/current.json'))['path'])")
+        cp "$BUNDLE_PATH"/manifests/*.yaml charts/platform-idms/templates/
+        python3 - <<'PY'
+        from pathlib import Path
+        import textwrap
 
-        # Update Chart.yaml with version
-        # SemVer format: MAJOR.MINOR.PATCH-prerelease
-        # Prerelease includes OCP version and commit hash for traceability
-        VERSION="1.0.0-ocp4.19.$(git rev-parse --short HEAD)"
+        bundle_yaml = Path('mirror/bundles/platform-day2/current.json').read_text()
+        bundle_path = __import__('json').loads(bundle_yaml)['path']
+        metadata = Path(bundle_path, 'bundle.yaml').read_text()
+        indented = textwrap.indent(metadata, '    ')
+        Path('charts/platform-idms/templates/00-platform-day2-bundle-metadata.yaml').write_text(
+            'apiVersion: v1\n'
+            'kind: ConfigMap\n'
+            'metadata:\n'
+            '  name: platform-day2-image-policy-bundle\n'
+            '  namespace: openshift-config\n'
+            'data:\n'
+            '  bundle.yaml: |\n'
+            f'{indented}'
+        )
+        PY
+
+        BUNDLE_VERSION=$(python3 -c "import json; print(json.load(open('mirror/bundles/platform-day2/current.json'))['version'])")
+        VERSION="1.0.0-platform-day2.${BUNDLE_VERSION}"
         echo "Setting chart version: $VERSION"
         sed -i "s/^version:.*/version: $VERSION/" charts/platform-idms/Chart.yaml
 
         echo "Chart contents:"
         ls -la charts/platform-idms/templates/
 
+    - name: Prepare selected OCI credentials and CA
+      run: |
+        set -euo pipefail
+        python3 scripts/prepare-isovalent-auth.py --selection mirror/isovalent-selection.yaml \
+          --output-root "$RUNNER_TEMP" --github-env "$GITHUB_ENV" --expected-registry "$LOCAL_REGISTRY"
+
     - name: Package and Push to OCI Registry
       run: |
+        set -euo pipefail
+        PACKAGE_DIR=$(mktemp -d "$RUNNER_TEMP/platform-idms.XXXXXX")
+        trap 'rm -rf -- "$PACKAGE_DIR"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
         echo "Packaging Helm chart..."
-        helm package charts/platform-idms -d /tmp/
+        helm package charts/platform-idms -d "$PACKAGE_DIR"
 
-        CHART_FILE=$(ls /tmp/platform-idms-*.tgz)
+        CHARTS=("$PACKAGE_DIR"/platform-idms-*.tgz)
+        test "${#CHARTS[@]}" -eq 1 && test -f "${CHARTS[0]}"
+        CHART_FILE="${CHARTS[0]}"
         echo "Chart package: $CHART_FILE"
 
         echo "Pushing to OCI registry..."
-        helm push "$CHART_FILE" oci://$LOCAL_REGISTRY/charts --insecure-skip-tls-verify
+        helm push "$CHART_FILE" "oci://$LOCAL_REGISTRY/charts" --ca-file "$SSL_CERT_FILE" --registry-config "$HELM_REGISTRY_CONFIG"
 
-        echo "## OCI Chart Published" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        VERSION=$(helm show chart charts/platform-idms | grep '^version:' | awk '{print $2}')
-        echo "**Chart:** \`oci://$LOCAL_REGISTRY/charts/platform-idms:$VERSION\`" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**ArgoCD Application source:**" >> $GITHUB_STEP_SUMMARY
-        echo '```yaml' >> $GITHUB_STEP_SUMMARY
-        echo "source:" >> $GITHUB_STEP_SUMMARY
-        echo "  repoURL: oci://$LOCAL_REGISTRY/charts" >> $GITHUB_STEP_SUMMARY
-        echo "  chart: platform-idms" >> $GITHUB_STEP_SUMMARY
-        echo "  targetRevision: \"$VERSION\"" >> $GITHUB_STEP_SUMMARY
-        echo '```' >> $GITHUB_STEP_SUMMARY
+        IMMUTABLE_VERSION=$(helm show chart charts/platform-idms | grep '^version:' | awk '{print $2}')
+        ALIAS_VERSION=""
+        if [ -n "${PLATFORM_DAY2_PROFILE:-}" ]; then
+          ALIAS_VERSION="0.0.0-platform-day2.${PLATFORM_DAY2_PROFILE}"
+          echo "Publishing platform-day2 profile alias: $ALIAS_VERSION"
+          sed -i "s/^version:.*/version: $ALIAS_VERSION/" charts/platform-idms/Chart.yaml
+          mkdir -p "$PACKAGE_DIR/alias"
+          helm package charts/platform-idms -d "$PACKAGE_DIR/alias"
+          ALIAS_CHARTS=("$PACKAGE_DIR"/alias/platform-idms-*.tgz)
+          test "${#ALIAS_CHARTS[@]}" -eq 1 && test -f "${ALIAS_CHARTS[0]}"
+          ALIAS_CHART_FILE="${ALIAS_CHARTS[0]}"
+          helm push "$ALIAS_CHART_FILE" "oci://$LOCAL_REGISTRY/charts" --ca-file "$SSL_CERT_FILE" --registry-config "$HELM_REGISTRY_CONFIG"
+        fi
+
+        {
+          echo "## platform-day2 OCI Chart Published"
+          echo ""
+          echo "**Immutable chart:** \`oci://$LOCAL_REGISTRY/charts/platform-idms:$IMMUTABLE_VERSION\`"
+          if [ -n "$ALIAS_VERSION" ]; then
+            echo "**Intent alias:** \`oci://$LOCAL_REGISTRY/charts/platform-idms:$ALIAS_VERSION\`"
+          fi
+          echo ""
+          echo "**ArgoCD Application source:**"
+          echo '```yaml'
+          echo "source:"
+          echo "  repoURL: oci://$LOCAL_REGISTRY/charts"
+          echo "  chart: platform-idms"
+          echo "  targetRevision: \"${ALIAS_VERSION:-$IMMUTABLE_VERSION}\""
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Remove selected OCI credentials and trust
+      if: always()
+      run: |
+        if [ -n "${ISOVALENT_AUTH_DIR:-}" ]; then rm -rf -- "$ISOVALENT_AUTH_DIR"; fi
+
+
+  sync-hcp-cache:
+    needs: [validate-inputs]
+    name: Selected hosted cache source images
+    if: ${{ !inputs.inspect_isovalent_release && inputs.sync_target == 'hcp-cache' }}
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    env:
+      HCP_CACHE_SOURCE_AUTH: ${{ secrets.HCP_CACHE_SOURCE_AUTH }}
+      CACHE_CONTRACT: ${{ inputs.hcp_cache_contract }}
+      CACHE_CA_FILE: ${{ inputs.hcp_cache_ca_file }}
+      VALIDATE_ONLY: ${{ inputs.validate_only }}
+      CRANE_VERSION: 0.22.0
+      CRANE_ARCHIVE_SHA256: edb74d53fad9a596860f59d1c5d04a43dfb5f441dc71f57060dd0bf39483c833
+    steps:
+    - uses: actions/checkout@v4
+    - name: Resolve selected registry input
+      run: |
+        set -euo pipefail
+        registry_output=$(mktemp "$RUNNER_TEMP/registry-output.XXXXXX")
+        trap 'rm -f -- "$registry_output"' EXIT
+        python3 scripts/read-registry-contract.py --output "$registry_output" --selection mirror/isovalent-selection.yaml
+        sed 's/^registry=/LOCAL_REGISTRY=/' "$registry_output" >> "$GITHUB_ENV"
+
+    - name: Prepare private cache producer client
+      run: |
+        set -euo pipefail
+        umask 077
+        CACHE_WORKDIR=$(mktemp -d "$RUNNER_TEMP/hcp-cache.XXXXXX")
+        echo "CACHE_WORKDIR=$CACHE_WORKDIR" >> "$GITHUB_ENV"
+        mkdir -p "$CACHE_WORKDIR/auth" "$CACHE_WORKDIR/bin" "$CACHE_WORKDIR/evidence"
+        test -n "$HCP_CACHE_SOURCE_AUTH"
+        printf '%s' "$HCP_CACHE_SOURCE_AUTH" > "$CACHE_WORKDIR/auth/config.json"
+        curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+          "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+          --output "$CACHE_WORKDIR/crane.tar.gz"
+        echo "$CRANE_ARCHIVE_SHA256  $CACHE_WORKDIR/crane.tar.gz" | sha256sum --check --strict
+        tar -xzf "$CACHE_WORKDIR/crane.tar.gz" -C "$CACHE_WORKDIR/bin" crane
+        echo "$CACHE_WORKDIR/bin" >> "$GITHUB_PATH"
+    - name: Produce or read-verify selected site images
+      run: |
+        set -euo pipefail
+        COPY_ARGS=()
+        if [ "$VALIDATE_ONLY" != true ]; then COPY_ARGS=(--copy); fi
+        CA_ARGS=()
+        if [ -n "$CACHE_CA_FILE" ]; then CA_ARGS=(--ca-file "$CACHE_CA_FILE"); fi
+        python3 scripts/hcp-cache-images.py --contract "$CACHE_CONTRACT" \
+          --expected-site-registry "$LOCAL_REGISTRY" --stage site "${COPY_ARGS[@]}" \
+          --auth-dir "$CACHE_WORKDIR/auth" "${CA_ARGS[@]}" --receipt "$CACHE_WORKDIR/evidence/verification.json"
+        cp -f "$CACHE_CONTRACT" "$CACHE_WORKDIR/evidence/contract.json"
+        if [ "$VALIDATE_ONLY" != true ]; then
+          python3 scripts/promote-image-policy-bundle.py --scope hcp-cache --sync-target hcp-cache \
+            --cache-contract "$CACHE_CONTRACT" --cache-verification "$CACHE_WORKDIR/evidence/verification.json" \
+            --registry "$LOCAL_REGISTRY" --output-root "$CACHE_WORKDIR/evidence/bundles"
+        fi
+    - uses: actions/upload-artifact@v4
+      with:
+        name: selected-cache-source-evidence
+        path: ${{ env.CACHE_WORKDIR }}/evidence/
+        if-no-files-found: error
+    - name: Cleanup private cache producer client
+      if: always()
+      run: |
+        if [ -n "${CACHE_WORKDIR:-}" ]; then rm -rf -- "$CACHE_WORKDIR"; fi
 
   #----------------------------------------------------------------------------
   # Summary
   #----------------------------------------------------------------------------
   summary:
     name: 'Summary'
-    runs-on: [self-hosted, linux, saif-github-runner]
-    needs: [sync-platform, sync-redhat-ops, sync-other, combine-idms, package-oci]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    needs: [validate-inputs, sync-hcp-cache, inspect-isovalent-release, sync-platform, sync-redhat-ops, sync-isovalent, sync-other, promote-bundles, package-oci]
     if: always()
 
     steps:
     - name: Generate Summary
       run: |
-        echo "## Image Sync Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-        echo "**Registry:** ${{ vars.OCP_REGISTRY_URL }}" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Job Results" >> $GITHUB_STEP_SUMMARY
-        echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
-        echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
-        echo "| Platform Images | ${{ needs.sync-platform.result }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Red Hat Operators | ${{ needs.sync-redhat-ops.result }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Other Images | ${{ needs.sync-other.result }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Combine IDMS | ${{ needs.combine-idms.result }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Package OCI | ${{ needs.package-oci.result }} |" >> $GITHUB_STEP_SUMMARY
+        {
+          echo "## Image Sync Summary"
+          echo ""
+          echo "**Trigger:** ${{ github.event_name }}"
+          echo "**Registry:** ${{ needs.validate-inputs.outputs.registry }}"
+          echo ""
+          echo "### Job Results"
+          echo "| Job | Status |"
+          echo "|-----|--------|"
+          echo "| IEP Release Inspection | ${{ needs.inspect-isovalent-release.result }} |"
+          echo "| Selected Cache | ${{ needs.sync-hcp-cache.result }} |"
+          echo "| Platform Images | ${{ needs.sync-platform.result }} |"
+          echo "| Red Hat Operators | ${{ needs.sync-redhat-ops.result }} |"
+          echo "| Isovalent Images | ${{ needs.sync-isovalent.result }} |"
+          echo "| Other Images | ${{ needs.sync-other.result }} |"
+          echo "| Promote Bundles | ${{ needs.promote-bundles.result }} |"
+          echo "| Package platform-day2 OCI | ${{ needs.package-oci.result }} |"
+        } >> "$GITHUB_STEP_SUMMARY"

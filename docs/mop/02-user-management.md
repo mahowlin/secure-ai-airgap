@@ -7,7 +7,7 @@ Provision OpenShift cluster users with HTPasswd authentication and optional jump
 ## Prerequisites
 
 - GitHub CLI authenticated (`gh auth login`)
-- Access to mahowlin/saif-sys-admin repository
+- Access to mahowlin/secure-ai-airgap repository
 - Target cluster operational
 
 ## Procedure: Create User
@@ -27,20 +27,20 @@ Optional:
 
 ```bash
 gh workflow run manage-cluster-users.yaml \
-  -f cluster_name=ai-pod-1 \
+  -f cluster_name=example-node-1 \
   -f users=johndoe \
   -f emails=johndoe@cisco.com \
   -f password='SecurePassword123!' \
   -f role=cluster-admin \
   -f ssh_pubkeys='ssh-ed25519 AAAA... johndoe@laptop' \
   -f action=create \
-  --repo mahowlin/saif-sys-admin
+  --repo mahowlin/secure-ai-airgap
 ```
 
 ### Step 3: Monitor Workflow
 
 ```bash
-gh run watch --repo mahowlin/saif-sys-admin
+gh run watch --repo mahowlin/secure-ai-airgap
 ```
 
 ### Step 4: Verify User Access
@@ -58,13 +58,13 @@ Provide comma-separated values:
 
 ```bash
 gh workflow run manage-cluster-users.yaml \
-  -f cluster_name=ai-pod-1 \
+  -f cluster_name=example-node-1 \
   -f users='user1,user2,user3' \
   -f emails='user1@cisco.com,user2@cisco.com,user3@cisco.com' \
   -f password='SharedPassword123!' \
   -f role=edit \
   -f action=create \
-  --repo mahowlin/saif-sys-admin
+  --repo mahowlin/secure-ai-airgap
 ```
 
 ---
@@ -73,11 +73,11 @@ gh workflow run manage-cluster-users.yaml \
 
 ```bash
 gh workflow run manage-cluster-users.yaml \
-  -f cluster_name=ai-pod-1 \
+  -f cluster_name=example-node-1 \
   -f users=ignored \
   -f role=cluster-admin \
   -f action=list \
-  --repo mahowlin/saif-sys-admin
+  --repo mahowlin/secure-ai-airgap
 ```
 
 Check workflow output for user list.
@@ -88,11 +88,11 @@ Check workflow output for user list.
 
 ```bash
 gh workflow run manage-cluster-users.yaml \
-  -f cluster_name=ai-pod-1 \
+  -f cluster_name=example-node-1 \
   -f users=johndoe \
   -f role=cluster-admin \
   -f action=delete \
-  --repo mahowlin/saif-sys-admin
+  --repo mahowlin/secure-ai-airgap
 ```
 
 This removes:

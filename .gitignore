@@ -1,8 +1,11 @@
-.DS_Store
-.claude/
-.venv/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+
+# Local Python checks
 __pycache__/
-*.pyc
-*.retry
-credentials.env
-secrets/
+*.py[cod]
+.venv/

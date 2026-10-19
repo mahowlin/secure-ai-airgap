@@ -1,7 +1,3 @@
-# Copyright (c) 2026 Cisco and/or its affiliates.
-# Licensed under the Cisco Sample Code License, Version 1.1
-# See LICENSE in the project root.
-
 name: 'Sync NVIDIA LLM'
 
 # Mirrors NVIDIA NIM LLM container images to local registry
@@ -47,6 +43,8 @@ on:
     secrets:
       NVIDIA_NGC_API_KEY:
         required: false
+      REDHAT_PULL_SECRET:
+        required: false
 
 permissions:
   contents: read
@@ -54,27 +52,39 @@ permissions:
 env:
   LOCAL_REGISTRY: ${{ vars.OCP_REGISTRY_URL }}
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   sync-nvidia-llm:
     name: 'Mirror NVIDIA LLM Image'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     # Run directly on runner (not in container) for docker access
     timeout-minutes: 360  # 6 hours for large NIM images (~10GB compressed)
 
     steps:
     - name: Parse Image Reference
       id: parse
+      env:
+        SOURCE_IMAGE_INPUT: ${{ inputs.image }}
+      shell: bash
       run: |
-        IMAGE="${{ inputs.image }}"
+        set -euo pipefail
+        IMAGE="$SOURCE_IMAGE_INPUT"
+        [[ "$IMAGE" =~ ^[A-Za-z0-9._:/@-]+$ ]] || exit 1
+        : "${LOCAL_REGISTRY:?selected destination registry required}"
 
         # Extract registry, repository, and tag
         # Handle different formats: registry/repo:tag, registry/repo@sha256:...
         if [[ "$IMAGE" == *"@sha256:"* ]]; then
           REGISTRY_REPO="${IMAGE%%@*}"
           TAG="${IMAGE##*@}"
+          [[ "$TAG" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
           IS_DIGEST=true
         else
-          REGISTRY_REPO="${IMAGE%%:*}"
+          [[ "${IMAGE##*/}" == *:* ]] || { echo 'Explicit source tag or digest required' >&2; exit 1; }
+          REGISTRY_REPO="${IMAGE%:*}"
           TAG="${IMAGE##*:}"
           IS_DIGEST=false
         fi
@@ -86,7 +96,7 @@ jobs:
         # Construct local image reference
         LOCAL_IMAGE="${LOCAL_REGISTRY}/${REPO}:${TAG##sha256:}"
         if [ "$IS_DIGEST" = "true" ]; then
-          LOCAL_IMAGE="${LOCAL_REGISTRY}/${REPO}@${TAG}"
+          LOCAL_IMAGE="${LOCAL_REGISTRY}/${REPO}:sha256-${TAG#sha256:}"
         fi
 
         echo "source_image=$IMAGE" >> $GITHUB_OUTPUT
@@ -103,6 +113,33 @@ jobs:
         echo "- **Tag:** $TAG" >> $GITHUB_STEP_SUMMARY
         echo "- **Local:** $LOCAL_IMAGE" >> $GITHUB_STEP_SUMMARY
 
+    - name: Configure Registry Auth
+      env:
+        NVIDIA_NGC_API_KEY: ${{ secrets.NVIDIA_NGC_API_KEY }}
+        REDHAT_PULL_SECRET: ${{ secrets.REDHAT_PULL_SECRET }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        umask 077
+        PRIVATE_AUTH=$(mktemp -d "$RUNNER_TEMP/optional-image-auth.XXXXXX")
+        echo "OPTIONAL_IMAGE_AUTH=$PRIVATE_AUTH" >> "$GITHUB_ENV"
+        echo "DOCKER_CONFIG=$PRIVATE_AUTH" >> "$GITHUB_ENV"
+        export DOCKER_CONFIG="$PRIVATE_AUTH"
+        export REGISTRY_AUTH_FILE="$PRIVATE_AUTH/config.json"
+        echo "REGISTRY_AUTH_FILE=$REGISTRY_AUTH_FILE" >> "$GITHUB_ENV"
+        python3 - <<'PYTHON'
+        import json,os
+        from pathlib import Path
+        auth=json.loads(os.environ.get('REDHAT_PULL_SECRET') or '{"auths":{}}')
+        if not isinstance(auth.get('auths'),dict):
+            raise SystemExit('invalid runtime registry authentication input')
+        Path(os.environ['REGISTRY_AUTH_FILE']).write_text(json.dumps(auth))
+        PYTHON
+        chmod 600 "$REGISTRY_AUTH_FILE"
+        if [ -n "$NVIDIA_NGC_API_KEY" ]; then
+          printf '%s' "$NVIDIA_NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+        fi
+
     - name: Check Local Registry
       id: check_local
       if: inputs.skip_if_exists == true
@@ -112,7 +149,7 @@ jobs:
         echo "Checking if image exists in local registry..."
 
         # Use skopeo to check if image exists (faster than docker pull)
-        if skopeo inspect --tls-verify=false "docker://${LOCAL_IMAGE}" > /dev/null 2>&1; then
+        if skopeo inspect --tls-verify=true "docker://${LOCAL_IMAGE}" > /dev/null 2>&1; then
           echo "exists=true" >> $GITHUB_OUTPUT
           echo "Image already exists in local registry"
           echo "## Result: Skipped" >> $GITHUB_STEP_SUMMARY
@@ -122,27 +159,9 @@ jobs:
           echo "Image not found in local registry, will pull"
         fi
 
-    - name: Configure Registry Auth
-      if: steps.check_local.outputs.exists != 'true'
-      env:
-        NVIDIA_NGC_API_KEY: ${{ secrets.NVIDIA_NGC_API_KEY }}
-      run: |
-        SOURCE_REGISTRY="${{ steps.parse.outputs.source_registry }}"
-
-        mkdir -p ~/.docker
-        echo '{"auths":{}}' > ~/.docker/config.json
-
-        # Add NGC auth for nvcr.io
-        if [[ "$SOURCE_REGISTRY" == "nvcr.io" ]] && [ -n "$NVIDIA_NGC_API_KEY" ]; then
-          echo "Configuring NVIDIA NGC authentication..."
-          echo "$NVIDIA_NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
-        fi
-
-        echo "Registry authentication configured for $SOURCE_REGISTRY"
-
     - name: Pull Image
       id: pull
-      if: steps.check_local.outputs.exists != 'true'
+      if: steps.check_local.outputs.exists != 'true' && steps.parse.outputs.is_digest != 'true'
       run: |
         SOURCE_IMAGE="${{ steps.parse.outputs.source_image }}"
         FORCE_PULL="${{ inputs.force_pull }}"
@@ -184,7 +203,7 @@ jobs:
         fi
 
     - name: Tag for Local Registry
-      if: steps.check_local.outputs.exists != 'true'
+      if: steps.check_local.outputs.exists != 'true' && steps.parse.outputs.is_digest != 'true'
       run: |
         SOURCE_IMAGE="${{ steps.parse.outputs.source_image }}"
         LOCAL_IMAGE="${{ steps.parse.outputs.local_image }}"
@@ -202,6 +221,12 @@ jobs:
         echo "Pushing to local registry..."
         START_TIME=$(date +%s)
 
+        if [ "${{ steps.parse.outputs.is_digest }}" = true ]; then
+          skopeo copy --all --preserve-digests --src-tls-verify=true --dest-tls-verify=true \
+            --authfile "$REGISTRY_AUTH_FILE" "docker://${{ steps.parse.outputs.source_image }}" "docker://$LOCAL_IMAGE"
+          echo "push_success=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
         if docker push "$LOCAL_IMAGE"; then
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - START_TIME))
@@ -223,7 +248,7 @@ jobs:
         LOCAL_IMAGE="${{ steps.parse.outputs.local_image }}"
 
         echo "Verifying image in local registry..."
-        if skopeo inspect --tls-verify=false "docker://${LOCAL_IMAGE}" > /dev/null 2>&1; then
+        if skopeo inspect --tls-verify=true "docker://${LOCAL_IMAGE}" > /dev/null 2>&1; then
           echo "## Verification: SUCCESS" >> $GITHUB_STEP_SUMMARY
           echo "Image successfully mirrored to \`${LOCAL_IMAGE}\`" >> $GITHUB_STEP_SUMMARY
         else
@@ -239,7 +264,12 @@ jobs:
         # docker image prune -f
 
         # Remove auth config
-        rm -f ~/.docker/config.json
+        if [ -n "${OPTIONAL_IMAGE_AUTH:-}" ]; then
+          case "$OPTIONAL_IMAGE_AUTH" in
+            "$RUNNER_TEMP"/optional-image-auth.*) rm -rf "$OPTIONAL_IMAGE_AUTH" ;;
+            *) exit 1 ;;
+          esac
+        fi
 
         echo "Cleanup complete"
 

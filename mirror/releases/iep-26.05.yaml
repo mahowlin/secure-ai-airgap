@@ -1,0 +1,66 @@
+# Authenticated upstream contract for IEP 26.05 / Cilium and CLIFE 1.19.5.
+# The CLIFE fields are populated only from the metadata-only discovery workflow,
+# then reviewed and pinned before the mirror workflow is allowed to run.
+release: "26.05"
+version: "1.19.5"
+ociChart:
+  registry: registry.isovalent.com
+  repository: cilium
+  version: "1.19.5"
+  digest: sha256:96f3e14236dc3a06133505690da9ae5e9c6cd30b7d5055f49491864a5f8bfd6b
+helmRepository:
+  indexUrl: https://charts.isovalent.com/index.yaml
+clifeBundle:
+  url: https://artifactory.isovalent.com/artifactory/archive/clife-manifests/clife-v1.19.5.tar.gz
+  sha256: b71c62aeeb3c8272aad5942e6699940c99f25d8de60d325e3944b66a4dd7d46f
+  controllerImage: containers.isovalent.com/clife:v1.19.5-cee.1@sha256:f389f09f3adb832baef5f498097f49413da7fe75500beac783b6ea007c218046
+  controllerDigest: sha256:f389f09f3adb832baef5f498097f49413da7fe75500beac783b6ea007c218046
+  controllerMirrorRepository: clife
+operands:
+  - name: cilium
+    image: containers.isovalent.com/cilium:v1.19.5-cee.1
+    digest: sha256:e6d4cc9b7305a37cb093f6058d6a8bc9a4daf62769150f2f50b67d8cbf348763
+    mirrorRepository: cilium
+  - name: cilium-envoy
+    image: containers.isovalent.com/cilium-envoy:v1.19.5-cee.1
+    digest: sha256:767101fb8a5e38f055778cb43b7aa8eed80450b37f8121effac3d9de9e06dc99
+    mirrorRepository: cilium-envoy
+  - name: operator-generic
+    image: containers.isovalent.com/operator-generic:v1.19.5-cee.1
+    digest: sha256:12e6f4db1456a320ec5853c36422c0eae5b47344bda0f2fc69c00672e8cf647c
+    mirrorRepository: operator-generic
+  - name: hubble-relay
+    image: containers.isovalent.com/hubble-relay:v1.19.5-cee.1
+    digest: sha256:0a6f3db184dfe50d049ebf72cb34a7846f74ecfb814c53109c1e225c0999f762
+    mirrorRepository: hubble-relay
+runtimeImages:
+  # Official CLIFE 1.19.5 embeds the Cilium chart and selects these UBI
+  # repositories for the management and hosted-cluster package modes.
+  - name: cilium
+    image: containers.isovalent.com/cilium-ubi:v1.19.5-cee.1
+    digest: sha256:73eba6a0a7dd467dc9733cf3ad68b425b6b1702d53c0bd0553ee3de8b2369040
+    mirrorRepository: cilium-ubi
+  - name: cilium-envoy
+    image: containers.isovalent.com/cilium-envoy-ubi:v1.19.5-cee.1
+    digest: sha256:ef4fe3701412aa2f01705bb5e9a545424cb5ee9b5aa93df3e643738873c97d28
+    mirrorRepository: cilium-envoy-ubi
+  - name: operator-generic
+    image: containers.isovalent.com/operator-generic-ubi:v1.19.5-cee.1
+    digest: sha256:912c84f7e07f3f28bf8cd3762a0e7d281d809d2726b0c38fe605e785c32ce0e9
+    mirrorRepository: operator-generic-ubi
+  - name: hubble-relay
+    image: containers.isovalent.com/hubble-relay-ubi:v1.19.5-cee.1
+    digest: sha256:9d3423ed3adda9d4c0a0c67fc6e8438058157fb7e4b029b000734c3826cf23e0
+    mirrorRepository: hubble-relay-ubi
+  - name: startup-script
+    image: containers.isovalent.com/startup-script-ubi:v1.19.5-cee.1
+    digest: sha256:9f3a55ccf6c97e7ababd5027647f55df4a018a87bdf799c7902ec85737c8f9a5
+    mirrorRepository: startup-script-ubi
+  - name: hubble-timescape-lite
+    image: containers.isovalent.com/hubble-timescape-lite-ubi:v1.19.1
+    digest: sha256:e52f4e8c50ca6be560d0f368d5dcfc79e7dd1e2a464867236b6e61b2cad02954
+    mirrorRepository: hubble-timescape-lite-ubi
+  - name: cilium-clickhouse-server
+    image: containers.isovalent.com/cilium-clickhouse-server:v1.19.5-cee.1
+    digest: sha256:f55a1dec22cea056abb32eccf4fad01d4561d8fad47f1c116801ec41f9ae2dc4
+    mirrorRepository: cilium-clickhouse-server

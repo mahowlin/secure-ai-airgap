@@ -1,112 +1,53 @@
-# SAIF System Administration
+# Cisco Secure AI Airgap
 
-Infrastructure services for the SAIF Platform -- image mirroring, user management, and runner VM operations.
+Run the shared infrastructure services and image-delivery layer for [Cisco Secure AI Datacenter](https://github.com/mahowlin/secure-ai-datacenter). This repository configures the external services host, mirrors vendor images into its registry, and supplies the image configuration consumed by OpenShift installation and nested tenant clusters.
 
-## Overview
+[![Vendor images enter the external site registry. Management OpenShift boots from that registry; its mirror operator copies selected images into an in-cluster cache for tenant control-plane pods and KubeVirt worker VMs. The external host also supplies runners, installer media, state and S3 services.](docs/diagrams/airgap-overview.svg)](docs/diagrams/airgap-overview.svg)
 
-This repository manages the foundational infrastructure that all clusters depend on:
+## Services this repository provides
 
-- **Image Mirroring**: Syncs container images from public registries to an internal registry for air-gapped operation
-- **User Management**: Automated OpenShift user provisioning with RBAC and SSH access
-- **Runner VM**: Self-hosted GitHub Actions runners, container registry, web server, and git server
+| Service | Its place in the platform | Where to start |
+|---|---|---|
+| **Container registry** | Holds mirrored OpenShift, Isovalent, storage and selected AI images for installation and runtime pulls | [Image mirroring](docs/mop/01-image-mirroring.md) |
+| **GitHub Actions runners** | Execute the Datacenter, Compute, Fabric and service pipelines | [Runner/services setup](docs/mop/03-runner-vm.md) |
+| **Installer-media hosting** | nginx/WebDAV serves the Agent ISO produced by Compute for server boot | [Service-host architecture](docs/ARCHITECTURE.md#service-host) |
+| **S3 object storage** | RustFS stores Hubble flow exports consumed by Timescape | [Environment settings](environments/example/group_vars.yml) |
+| **Terraform state service** | Stores and locks infrastructure execution state | [Environment settings](environments/example/group_vars.yml) |
 
-## Prerequisites
+[Environment settings](environments/example/group_vars.yml) define the service ports, storage, runner capacity and enabled components; [hosts.ini](environments/example/hosts.ini) selects the host. The [configure-runner playbook](ansible/playbooks/configure-runner.yaml) applies that profile through the owning pipeline. Gitea remains a legacy cache; GitHub is the platform's source and workflow system.
 
-- GitHub Actions self-hosted runner with Docker-in-Docker
-- Internal container registry (registry:2)
-- Red Hat pull secret for registry authentication
-- SSH access to target OpenShift clusters via jump host
+## Vendor images → YAML definitions
 
-## Usage
+| Vendor / image family | What the inventory contains | Maintained YAML |
+|---|---|---|
+| **Red Hat: OpenShift** | Release payload and RHCOS container disks for KubeVirt workers | [platform-images.yaml](mirror/platform-images.yaml) |
+| **Red Hat: operators** | OpenShift GitOps, Virtualization, MCE, NMState and selected platform operators | [redhat-operators.yaml](mirror/redhat-operators.yaml) |
+| **Isovalent (Cisco)** | CLife, Cilium, Hubble/Timescape and Tetragon selections | [isovalent-selection.yaml](mirror/isovalent-selection.yaml) → [isovalent-images.yaml](mirror/isovalent-images.yaml) |
+| **Pure Storage / Portworx** | Storage operator, storage engine, CSI and related components | [portworx-images.yaml](mirror/portworx-images.yaml) |
+| **NVIDIA** | GPU Operator, NIM and selected CUDA images | [other-images.yaml](mirror/other-images.yaml) |
+| **Supporting observability/tools** | Selected ClickHouse, Splunk/OpenTelemetry and utility images | [other-images.yaml](mirror/other-images.yaml) |
 
-### Image Mirroring
+Isovalent's selection links the exact [CLife release](mirror/releases/clife-1.19.7.yaml) and [IEP release](mirror/releases/iep-26.05.yaml) contracts. [mirror-policy-sources.yaml](mirror/mirror-policy-sources.yaml) supplies additional source-prefix mappings for generated IDMS/ITMS policy. Change the maintained inventories to change the selected images.
 
-```bash
-# Dry run (preview what will be mirrored)
-gh workflow run sync-images.yaml -f dry_run=true
+## Follow the image architecture
 
-# Mirror images to internal registry
-gh workflow run sync-images.yaml -f dry_run=false
+1. **Vendor sources → external registry.** The [Sync Images workflow](.github/workflows/sync-images.yaml) reads the YAML inventories below and mirrors their selected content into the site registry.
+2. **External registry → management OpenShift.** Compute uses the selected release, CNI and operator content to install the physical management cluster.
+3. **External registry → mirror operator → in-cluster registry/cache.** The Kubernetes mirror operator copies its selected image inventory into persistent storage on the management cluster.
+4. **In-cluster images → nested tenant clusters.** Tenant control-plane pods and KubeVirt worker VMs consume the selected image repositories through their configured mirror mappings.
 
-# Mirror with IDMS auto-apply and catalog refresh
-gh workflow run sync-images.yaml \
-  -f dry_run=false \
-  -f apply_idms=true \
-  -f cluster_name=ai-pod-1 \
-  -f refresh_catalogs=true
-```
+This is **nested Kubernetes (“Kubernetes in Kubernetes”)**: HyperShift control planes run as pods on management OpenShift, while tenant worker nodes run inside KubeVirt VMs. Airgap supplies the external registry and services; Datacenter composes the cluster configuration, and GitOps delivers the in-cluster registry, mirror-operator and tenant resources.
 
-### User Management
+[Registry-chain architecture](docs/REGISTRY_CHAIN.md) expands these connections. [Cache trust and credentials](docs/mop/06-hcp-local-registry-trust.md) explains the source-pull, destination-write and workload-read paths.
 
-```bash
-# Create a cluster user with SSH access
-gh workflow run manage-cluster-users.yaml \
-  -f cluster_name=ai-pod-1 \
-  -f users=username \
-  -f emails=user@example.com \
-  -f password='<PASSWORD>' \
-  -f role=cluster-admin \
-  -f ssh_pubkeys='ssh-ed25519 AAAA...' \
-  -f action=create
-```
+## Configure and use it
 
-### Runner VM Configuration
+1. Copy the [example environment](environments/example/) and set your service host, endpoints, storage and runner inputs. [Project inputs](docs/PROJECT_INPUTS.md) explains how Datacenter's generated contract supplies shared values.
+2. Configure the services through the [runner pipeline](docs/mop/03-runner-vm.md), then run the [image mirroring procedure](docs/mop/01-image-mirroring.md) for the selected inventories.
+3. Pass the resulting image policies and content receipts into the Datacenter, Compute and GitOps handoffs.
 
-```bash
-# Configure all services
-gh workflow run configure-runner-vm.yaml -f tags=all
+[AGENTS.md](AGENTS.md) links exact checks and execution procedures. [Troubleshooting](docs/mop/04-troubleshooting.md) covers service and mirroring failures; [operator artifact preparation](.github/actions/prepare-operator-inputs/action.yaml) provides Datacenter's pinned build-time inspection inputs.
 
-# Configure specific services
-gh workflow run configure-runner-vm.yaml -f tags="registry,webserver"
-```
+## License and help
 
-## Required Secrets
-
-| Secret | Purpose |
-|--------|---------|
-| `REDHAT_PULL_SECRET` | Red Hat registry authentication |
-| `KUBECONFIG_REPO_TOKEN` | Access to cluster kubeconfigs |
-| `WEBEX_BOT_TOKEN` | WebEx notifications (user management) |
-| `JUMP_HOST_SSH_KEY` | SSH key for jump host access |
-
-## Directory Structure
-
-```
-saif-sys-admin/
-├── .github/workflows/          # GitHub Actions workflows
-│   ├── sync-images.yaml        # Mirror container images
-│   ├── manage-cluster-users.yaml  # User provisioning
-│   ├── configure-runner-vm.yaml   # Runner VM setup
-│   └── build-*.yaml            # Container image builds
-├── mirror/                     # Image mirroring configuration
-│   ├── platform-images.yaml    # Platform image list
-│   ├── other-images.yaml       # Additional images
-│   └── idms/                   # ImageDigestMirrorSet manifests
-├── ansible/                    # Ansible playbooks
-│   └── playbooks/
-│       └── configure-runner.yaml  # Runner VM configuration
-├── environments/               # Environment configs
-│   └── example/                # Example environment
-└── docs/                       # Documentation
-```
-
-## Documentation
-
-- [Architecture](docs/ARCHITECTURE.md) - System design and integration points
-- [MOPs](docs/mop/) - Operational procedures
-  - [Image Mirroring](docs/mop/01-image-mirroring.md)
-  - [User Management](docs/mop/02-user-management.md)
-  - [Runner VM](docs/mop/03-runner-vm.md)
-  - [Troubleshooting](docs/mop/04-troubleshooting.md)
-
-## Related Repositories
-
-| Repository | Relationship |
-|------------|-------------|
-| [saif-platform](https://github.com/mahowlin/saif-platform) | Platform orchestration |
-| [saif-ai-pod](https://github.com/mahowlin/saif-ai-pod) | Consumes mirrored images during cluster deployment |
-| [saif-gitops](https://github.com/mahowlin/saif-gitops) | References mirrored images, syncs IDMS |
-
-## License
-
-This project is licensed under the Cisco Sample Code License, Version 1.1. See [LICENSE](LICENSE) for details.
+See [LICENSE](LICENSE) and the shared [contribution/help guide](https://github.com/mahowlin/secure-ai-datacenter/blob/main/CONTRIBUTING.md). Product images and archives require the appropriate vendor entitlement; private credentials remain in the site's pipeline custody.

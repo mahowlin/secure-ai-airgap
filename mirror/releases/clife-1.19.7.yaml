@@ -1,0 +1,37 @@
+release: '26.05'
+version: 1.19.7
+clifeBundle:
+  url: https://artifactory.isovalent.com/artifactory/archive/clife-manifests/clife-v1.19.7.tar.gz
+  sha256: f0eb8988a36a25b40fd8d3c60e8bcb4d94f20472e4481a7711d66f51fcd46252
+  controllerImage: containers.isovalent.com/clife:v1.19.7-cee.3@sha256:9030cd40156f11115da0f0a5221efa0d6dda6e3d32cd63735ee94c7349496aae
+  controllerDigest: sha256:9030cd40156f11115da0f0a5221efa0d6dda6e3d32cd63735ee94c7349496aae
+  controllerMirrorRepository: clife
+runtimeImages:
+- name: cilium
+  image: containers.isovalent.com/cilium-ubi:v1.19.7-cee.3
+  digest: sha256:dfddee8e69d57bcaaa882d70d506f88e98c76fbf41198e3553a4d67cf9975228
+  mirrorRepository: cilium-ubi
+- name: cilium-envoy
+  image: containers.isovalent.com/cilium-envoy-ubi:v1.19.7-cee.3
+  digest: sha256:4b7a85313b8f113cc326506eab45f42d1fd9700cf82959ba00f747ad596a9235
+  mirrorRepository: cilium-envoy-ubi
+- name: operator-generic
+  image: containers.isovalent.com/operator-generic-ubi:v1.19.7-cee.3
+  digest: sha256:c0b7d6666c0b3357a6ea2b8a9b2a07d569b56349ce9fe845dd77e641c4059ed2
+  mirrorRepository: operator-generic-ubi
+- name: hubble-relay
+  image: containers.isovalent.com/hubble-relay-ubi:v1.19.7-cee.3
+  digest: sha256:efb6dacdf56fac1ffe88c960f602bdcb336870986f2d762963a9922b5e23a742
+  mirrorRepository: hubble-relay-ubi
+- name: startup-script
+  image: containers.isovalent.com/startup-script-ubi:v1.19.7-cee.3
+  digest: sha256:53c1c703536f4b4bb4cc45a98e998bf148c83c64b922396ee95315a1d428c4ab
+  mirrorRepository: startup-script-ubi
+- name: hubble-timescape-lite
+  image: containers.isovalent.com/hubble-timescape-lite-ubi:v1.19.5
+  digest: sha256:32cad75c423d493e1218a1b171a458579af6af8e324097c86a107210dede2738
+  mirrorRepository: hubble-timescape-lite-ubi
+- name: cilium-clickhouse-server
+  image: containers.isovalent.com/cilium-clickhouse-server:v1.19.7-cee.3
+  digest: sha256:8282545285f85be63ebf9e7f37cdc8ebfc7039ab40ec9987adaf053fd76797eb
+  mirrorRepository: cilium-clickhouse-server

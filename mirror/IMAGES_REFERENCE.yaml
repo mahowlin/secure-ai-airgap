@@ -1,23 +1,9 @@
-# Copyright (c) 2026 Cisco and/or its affiliates.
-# Licensed under the Cisco Sample Code License, Version 1.1
-# See LICENSE in the project root.
-
-#------------------------------------------------------------------------------
-# REFERENCE ONLY - Master Image List Documentation
-#------------------------------------------------------------------------------
-# This file documents ALL images for the SAIF environment. It is NOT used
-# directly by the sync-images workflow.
-#
-# ACTUAL WORKFLOW CONFIGS (these are what get mirrored):
-#   - platform-images.yaml   → OCP release images
-#   - redhat-operators.yaml  → Red Hat operator index
-#   - other-images.yaml      → Certified ops + additionalImages
-#
-# When adding new images:
-#   1. Add to this reference file (for documentation)
-#   2. Add to the appropriate workflow config file (for actual mirroring)
-#
-#------------------------------------------------------------------------------
+# HISTORICAL PARTIAL REFERENCE ONLY - not a selected copy recipe.
+# This retained snapshot is not a complete current image inventory and must not
+# be dispatched as a substitute for the declared workflow recipes.
+# Active owners: platform-images.yaml, redhat-operators.yaml, other-images.yaml,
+# and isovalent-selection.yaml plus its imageSet/contracts/runtimeImages.
+# Current source/mirror receipt validation, not this document, establishes closure.
 
 apiVersion: mirror.openshift.io/v2alpha1
 kind: ImageSetConfiguration
@@ -205,6 +191,26 @@ mirror:
     # This 9GB image needs dedicated sync workflow with resume capability
     # See: SYNC_IMAGES_PIPELINE_OPTIMIZATION.md Phase 1
     # - name: nvcr.io/nim/meta/llama-3.1-70b-instruct:1.15
+
+    #--------------------------------------------------------------------------
+    # Cisco Boutique Demo - Microservices Application
+    #--------------------------------------------------------------------------
+    # Required for CISCO_BOUTIQUE_DEPLOYMENT plan
+    # Source: https://github.com/nvibert/cisco-boutique-demo
+    # 11 microservices demonstrating Cilium L2 announcements and GatewayAPI
+    - name: us-docker.pkg.dev/gcp-cpagcpdemosdwan-nprd-95534/microservices-demo/frontend:102325-1
+    - name: us-docker.pkg.dev/gcp-cpagcpdemosdwan-nprd-95534/microservices-demo/cartservice:102325-1
+    - name: us-docker.pkg.dev/gcp-cpagcpdemosdwan-nprd-95534/microservices-demo/productcatalogservice:102325-1
+    - name: us-docker.pkg.dev/gcp-cpagcpdemosdwan-nprd-95534/microservices-demo/currencyservice:102325-1
+    - name: us-docker.pkg.dev/gcp-cpagcpdemosdwan-nprd-95534/microservices-demo/paymentservice:102325-1
+    - name: us-docker.pkg.dev/gcp-cpagcpdemosdwan-nprd-95534/microservices-demo/shippingservice:102325-1
+    - name: us-docker.pkg.dev/gcp-cpagcpdemosdwan-nprd-95534/microservices-demo/emailservice:102325-1
+    - name: us-docker.pkg.dev/gcp-cpagcpdemosdwan-nprd-95534/microservices-demo/checkoutservice:102325-1
+    - name: us-docker.pkg.dev/gcp-cpagcpdemosdwan-nprd-95534/microservices-demo/recommendationservice:102325-1
+    - name: us-docker.pkg.dev/gcp-cpagcpdemosdwan-nprd-95534/microservices-demo/adservice:102325-1
+    - name: us-docker.pkg.dev/gcp-cpagcpdemosdwan-nprd-95534/microservices-demo/loadgenerator:102325-1
+    # Redis for cart service
+    - name: docker.io/redis:alpine
 
   #----------------------------------------------------------------------------
   # Helm Charts - For Day 2 Operations

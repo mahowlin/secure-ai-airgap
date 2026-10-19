@@ -1,12 +1,8 @@
-# Copyright (c) 2026 Cisco and/or its affiliates.
-# Licensed under the Cisco Sample Code License, Version 1.1
-# See LICENSE in the project root.
-
 #------------------------------------------------------------------------------
 # Red Hat Operators - redhat-operator-index Only
 #------------------------------------------------------------------------------
 # Split config for parallel mirroring. See images-list.yaml for full config.
-# Estimated time: ~16 min (heaviest catalog)
+# Estimated time: ~45 min (expanded: +KubeVirt, RHACM/MCE, ODF, NMState)
 #------------------------------------------------------------------------------
 
 apiVersion: mirror.openshift.io/v2alpha1
@@ -29,8 +25,50 @@ mirror:
         - name: lvms-operator
           channels:
             - name: stable-4.19
+              minVersion: 4.19.2
+              maxVersion: 4.19.2
 
         # OpenShift GitOps Operator - ArgoCD for GitOps workflows
         - name: openshift-gitops-operator
           channels:
             - name: latest
+
+        # OpenShift Virtualization - KubeVirt for VM workloads
+        - name: kubevirt-hyperconverged
+          channels:
+            - name: stable
+
+        # NMState - OLM dependency for OpenShift Virtualization
+        - name: kubernetes-nmstate-operator
+          channels:
+            - name: stable
+
+        # Red Hat Advanced Cluster Management - HCP/HyperShift, governance, observability
+        - name: advanced-cluster-management
+          channels:
+            - name: release-2.16
+
+        # Multi-Cluster Engine - HCP core (included in RHACM, explicit for channel pinning)
+        - name: multicluster-engine
+          channels:
+            - name: stable-2.11
+
+        # OpenShift Data Foundation - Ceph storage for compact cluster
+        - name: odf-operator
+          channels:
+            - name: stable-4.19
+
+        # ODF CSI Add-ons
+        - name: odf-csi-addons-operator
+          channels:
+            - name: stable-4.19
+
+        # OpenShift Container Storage
+        - name: ocs-operator
+          channels:
+            - name: stable-4.19
+
+        # Multi-Cloud Gateway (ODF component)
+        - name: mcg-operator
+          channels:
+            - name: stable-4.19

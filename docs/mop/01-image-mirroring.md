@@ -1,150 +1,27 @@
-# Image Mirroring
+# Select and deliver images
 
-## Overview
+The maintained inventories describe actual source images, catalogs and exact release metadata. They are inputs to production, not proof of an installed site or a universally complete vendor catalog.
 
-Mirror container images from public registries to the internal registry for air-gapped cluster deployments.
+| Source selection | Maintained input | Needed for |
+|---|---|---|
+| OpenShift payload/channel and KubeVirt container disk | [mirror/platform-images.yaml](../../mirror/platform-images.yaml) | Management bootstrap; selected hosted release/disk dependencies |
+| Selected recipe/contracts | [mirror/isovalent-selection.yaml](../../mirror/isovalent-selection.yaml) | One binding through source discovery, copy, destination verification and receipt hashes |
+| CLife official archive, manager and runtime digests | [mirror/releases/clife-1.19.7.yaml](../../mirror/releases/clife-1.19.7.yaml), [Isovalent inventory](../../mirror/isovalent-images.yaml) | Exact selected Day 1 CNI and selected Isovalent components |
+| Red Hat operator catalog packages/channels | [mirror/redhat-operators.yaml](../../mirror/redhat-operators.yaml) | Selected GitOps, virtualization, MCE and other operators |
+| Other selected products/add-ons | [mirror/other-images.yaml](../../mirror/other-images.yaml), maintained product inputs | Only the features chosen for the composition |
+| Mirror destination/source mappings | [mirror/mirror-policy-sources.yaml](../../mirror/mirror-policy-sources.yaml), environment/project contract | Proposed IDMS/ITMS and matching actual registry content |
+| Hosted-cache complete selected closure | Customer-owned versioned inventory bound to Datacenter selection | Hosted release components, exact architecture/disk, guest CNI and selected add-ons |
 
-## Prerequisites
+## Production and consumer phases
 
-- GitHub CLI authenticated (`gh auth login`)
-- Access to mahowlin/saif-sys-admin repository
-- `REDHAT_PULL_SECRET` configured in GitHub Secrets
+Before management boot, the selected payload, installer/CNI images, official archive, DNS/time, entitlement, credentials and trusted registry must be available. A later management-hosted mirror operator copies selected content from the preceding registry to its hosted-image cache. For that composition the operator is part of the design, not the registry server itself. The cache cannot supply its own management bootstrap.
 
-## Procedure: Add New Images
+Hosted control-plane creation may resolve the release and import disks before any guest worker exists. The control-plane phase therefore needs its exact selected release/disk roots ready; the worker phase requires the remaining selected guest/add-on closure. Keep unknown dependencies explicit and refresh the reviewed inventory when releases/features change.
 
-### Step 1: Identify Required Images
+## Credentials and trust
 
-Determine what images need to be mirrored:
-- Operator images → `mirror/redhat-operators.yaml`
-- Platform images → `mirror/platform-images.yaml`
-- Community images → `mirror/other-images.yaml`
+Source entitlement, preceding-registry writer, cache writer and reader/pull identities have different roles. Supply those through the actual workflow/contract Secret references, not public input values. Trust uses normal system roots or the explicitly selected additional CA. Generated policy points at a registry; authenticated production must place the matching content there. The reader check verifies bytes and selected configuration on that verifier's path, not a cold guest pull or offline boot.
 
-### Step 2: Update Image List
+[AGENTS execution](../../AGENTS.md) links exact local policy generation, writing pipeline contracts and read-side checks. [The selected-cache lifecycle](https://github.com/mahowlin/secure-ai-datacenter/blob/main/docs/architectures/HCP_CACHE_LIFECYCLE.md) explains review/provenance and activation. [Registry maintenance](06-hcp-local-registry-trust.md) covers identities and trust rotation. Existing site registries and bare-metal-only installations need not select the hosted-cache composition.
 
-Edit the appropriate file in `mirror/`:
-
-```yaml
-# Example: Adding a new operator
-- name: registry.redhat.io/my-operator/controller
-  tag: v1.0.0
-```
-
-### Step 3: Preview Changes
-
-```bash
-gh workflow run sync-images.yaml \
-  -f dry_run=true \
-  --repo mahowlin/saif-sys-admin
-```
-
-Watch the workflow:
-```bash
-gh run watch --repo mahowlin/saif-sys-admin
-```
-
-Review the output to confirm expected images will be mirrored.
-
-### Step 4: Execute Mirroring
-
-```bash
-gh workflow run sync-images.yaml \
-  -f dry_run=false \
-  --repo mahowlin/saif-sys-admin
-```
-
-### Step 5: Sync IDMS to GitOps
-
-After mirroring completes, IDMS manifests are updated in `mirror/idms/`. These need to be synced to saif-gitops:
-
-```bash
-# In saif-gitops repo
-./scripts/sync-idms-from-sys-admin.sh
-git add apps/platform-idms/
-git commit -m "fix: Update IDMS from sys-admin"
-git push
-```
-
-### Step 6: Verify
-
-```bash
-# Check image exists in registry
-curl -s https://registry.example.com:5000/v2/<image>/tags/list
-
-# Check IDMS applied to cluster
-oc get imagedigestmirrorset
-```
-
----
-
-## Procedure: Full Resync
-
-When many images need updating or registry corruption suspected:
-
-```bash
-# Full resync (takes longer)
-gh workflow run sync-images.yaml \
-  -f dry_run=false \
-  -f force_resync=true \
-  --repo mahowlin/saif-sys-admin
-```
-
----
-
-## Image List Files
-
-### redhat-operators.yaml
-
-Red Hat certified operators from registry.redhat.io:
-- GPU Operator
-- NIM Operator
-- LVMS Operator
-- Sealed Secrets
-
-### platform-images.yaml
-
-OpenShift platform images:
-- OpenShift release images
-- Machine config operator
-- Console images
-
-### other-images.yaml
-
-Community and third-party images:
-- Cilium/Tetragon (quay.io/isovalent)
-- Vector (docker.io/timberio)
-- ClickHouse (ghcr.io)
-
----
-
-## Troubleshooting
-
-### Image Pull Fails
-
-```bash
-# Check if image is mirrored
-curl -s https://registry.example.com:5000/v2/<image>/tags/list
-
-# If not found, add to image list and re-run sync-images
-```
-
-### IDMS Not Working
-
-```bash
-# Check IDMS exists
-oc get imagedigestmirrorset
-
-# Check MachineConfigPool status (IDMS triggers reboot)
-oc get mcp
-
-# Check catalog pods restarted
-oc get pods -n openshift-marketplace
-```
-
-### Registry Connection Refused
-
-```bash
-# SSH to runner VM and check registry
-ssh runner-vm
-docker ps | grep registry
-docker logs registry 2>&1 | tail -20
-```
+The selected release binding checks only its explicitly listed release content; additional catalog/add-on inputs retain their own qualification. Destination verification uses the configured private auth file and normal client trust, as specified in [agent execution](../../agents/operations.md#authenticated-destination-verification). A source inventory or policy receipt is not evidence of anonymous access, cold pulls or a completed live rollout.

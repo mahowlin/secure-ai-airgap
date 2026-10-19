@@ -1,7 +1,3 @@
-# Copyright (c) 2026 Cisco and/or its affiliates.
-# Licensed under the Cisco Sample Code License, Version 1.1
-# See LICENSE in the project root.
-
 name: 'Sync NIM Models'
 
 # Downloads NIM model weights to runner VM for air-gapped cluster deployment
@@ -28,15 +24,19 @@ permissions:
   contents: read
 
 env:
-  CACHE_BASE: /data/images/nim-cache
-  REGISTRY: registry.example.com:5000
+  CACHE_ROOT: ${{ vars.NIM_MODEL_CACHE_ROOT }}
+  REGISTRY: ${{ vars.OCP_REGISTRY_URL }}
   IMAGE_TAG: "1.15"
-  HTTP_SERVER: http://10.0.0.10
+  HTTP_SERVER: ${{ vars.MODEL_HTTP_SERVER_URL }}
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   download-model:
     name: Download Model Cache
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     env:
       HTTP_USER: ${{ secrets.HTTP_SERVER_USER }}
       HTTP_PASS: ${{ secrets.HTTP_SERVER_PASSWORD }}
@@ -44,8 +44,14 @@ jobs:
       - name: Setup
         id: setup
         run: |
+          set -euo pipefail
+          : "${CACHE_ROOT:?declare the optional model cache root}" "${HTTP_SERVER:?declare the optional model HTTP endpoint}"
+          : "${HTTP_USER:?missing runtime model service username}" "${HTTP_PASS:?missing runtime model service password}"
+          case "$CACHE_ROOT" in /*) ;; *) echo 'Cache root must be absolute' >&2; exit 1 ;; esac
+          case "$HTTP_SERVER" in https://*) ;; *) echo 'Model service endpoint requires trusted HTTPS' >&2; exit 1 ;; esac
+
           MODEL="${{ github.event.inputs.model }}"
-          CACHE_PATH="${CACHE_BASE}/${MODEL}"
+          CACHE_PATH="${CACHE_ROOT}/${MODEL}"
           CACHE_URL="${HTTP_SERVER}/nim-cache/${MODEL}"
           echo "cache_path=$CACHE_PATH" >> $GITHUB_OUTPUT
           echo "cache_url=$CACHE_URL" >> $GITHUB_OUTPUT

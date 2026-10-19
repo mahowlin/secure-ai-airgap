@@ -1,0 +1,79 @@
+{
+  "schemaVersion": "hcp-oc-mirror-producer/v3",
+  "release": {
+    "version": "v0.1.7",
+    "commit": "eea10842d7048b61304151ee0b63d2e3b46d6846"
+  },
+  "destinationRegistry": "registry.example.com:5000",
+  "trust": {
+    "mode": "system"
+  },
+  "images": [
+    {
+      "role": "controller",
+      "source": "ghcr.io/mariusbertram/oc-mirror-operator-controller@sha256:47a842697f2a796b20b7ae550a1967fcb8ef0bd559c693dc4cfc6cb7cbd1da5a",
+      "destination": "registry.example.com:5000/ghcr.io/mariusbertram/oc-mirror-operator-controller:v0.1.7",
+      "digest": "sha256:47a842697f2a796b20b7ae550a1967fcb8ef0bd559c693dc4cfc6cb7cbd1da5a"
+    },
+    {
+      "role": "manager",
+      "source": "ghcr.io/mariusbertram/oc-mirror-operator-manager@sha256:07fd1d085da5a7dda4aad21ee196f68da9dbbcccecc8642d43f30b641c72fc7b",
+      "destination": "registry.example.com:5000/ghcr.io/mariusbertram/oc-mirror-operator-manager:v0.1.7",
+      "digest": "sha256:07fd1d085da5a7dda4aad21ee196f68da9dbbcccecc8642d43f30b641c72fc7b"
+    },
+    {
+      "role": "worker",
+      "source": "ghcr.io/mariusbertram/oc-mirror-operator-worker@sha256:1e5e1e70918e03d667bfcff7e85ced9a1bcc34576df122038baea812fe44696d",
+      "destination": "registry.example.com:5000/ghcr.io/mariusbertram/oc-mirror-operator-worker:v0.1.7",
+      "digest": "sha256:1e5e1e70918e03d667bfcff7e85ced9a1bcc34576df122038baea812fe44696d"
+    },
+    {
+      "role": "plugin-4-18",
+      "source": "ghcr.io/mariusbertram/oc-mirror-operator-plugin@sha256:a9623c82e6b45e864efddaaad60a10ab1fe9e7fcf9fa802f8c8481b8cd522c82",
+      "destination": "registry.example.com:5000/ghcr.io/mariusbertram/oc-mirror-operator-plugin:v0.1.7-ocp4.18",
+      "digest": "sha256:a9623c82e6b45e864efddaaad60a10ab1fe9e7fcf9fa802f8c8481b8cd522c82"
+    },
+    {
+      "role": "plugin-4-19",
+      "source": "ghcr.io/mariusbertram/oc-mirror-operator-plugin@sha256:9977c7a3184f60fa7e64eb1d5610ca2fd1759594eadec6452d5e4a2009eee7c4",
+      "destination": "registry.example.com:5000/ghcr.io/mariusbertram/oc-mirror-operator-plugin:v0.1.7-ocp4.19",
+      "digest": "sha256:9977c7a3184f60fa7e64eb1d5610ca2fd1759594eadec6452d5e4a2009eee7c4"
+    },
+    {
+      "role": "plugin-4-20",
+      "source": "ghcr.io/mariusbertram/oc-mirror-operator-plugin@sha256:43bfe8a3cd9b2dfaaad643d7358a963242cb27c2df3f694594a9fb1c07027084",
+      "destination": "registry.example.com:5000/ghcr.io/mariusbertram/oc-mirror-operator-plugin:v0.1.7-ocp4.20",
+      "digest": "sha256:43bfe8a3cd9b2dfaaad643d7358a963242cb27c2df3f694594a9fb1c07027084"
+    },
+    {
+      "role": "plugin-4-21",
+      "source": "ghcr.io/mariusbertram/oc-mirror-operator-plugin@sha256:4f46228343147b22bf147085fef014397c309699e123a73051944fc65c9e2371",
+      "destination": "registry.example.com:5000/ghcr.io/mariusbertram/oc-mirror-operator-plugin:v0.1.7-ocp4.21",
+      "digest": "sha256:4f46228343147b22bf147085fef014397c309699e123a73051944fc65c9e2371"
+    },
+    {
+      "role": "plugin-4-22",
+      "source": "ghcr.io/mariusbertram/oc-mirror-operator-plugin@sha256:51eb6e385906027cef4b1a5fc4b58b353aac493fd3ceea4357153fa6ec4bb0d3",
+      "destination": "registry.example.com:5000/ghcr.io/mariusbertram/oc-mirror-operator-plugin:v0.1.7-ocp4.22",
+      "digest": "sha256:51eb6e385906027cef4b1a5fc4b58b353aac493fd3ceea4357153fa6ec4bb0d3"
+    },
+    {
+      "role": "bundle",
+      "source": "quay.io/operatorhubio/oc-mirror@sha256:7460257327d45be9efb916e97c4b5b763a9fa588541f9f5909991acc987ac33a",
+      "destination": "registry.example.com:5000/quay.io/operatorhubio/oc-mirror:0.1.7",
+      "digest": "sha256:7460257327d45be9efb916e97c4b5b763a9fa588541f9f5909991acc987ac33a"
+    },
+    {
+      "role": "catalog",
+      "source": "quay.io/operatorhubio/catalog@sha256:f2fbc3625da08c4d88bc99a1880ded61dc376439ecdc8f7f2759215440f483b6",
+      "destination": "registry.example.com:5000/quay.io/operatorhubio/catalog:oc-mirror-0.1.7-20261016",
+      "digest": "sha256:f2fbc3625da08c4d88bc99a1880ded61dc376439ecdc8f7f2759215440f483b6"
+    }
+  ],
+  "installation": {
+    "method": "olm",
+    "package": "oc-mirror",
+    "channel": "alpha",
+    "startingCSV": "oc-mirror.v0.1.7"
+  }
+}

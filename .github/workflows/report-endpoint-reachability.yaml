@@ -1,0 +1,130 @@
+name: 'Report Endpoint Reachability'
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_set:
+        description: 'Reachability target set'
+        required: true
+        default: 'example-management'
+        type: choice
+        options:
+          - example-management
+      to_person_email:
+        description: 'Optional Webex recipient email'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    name: 'Endpoint reachability report'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          JUMP_HOST_SSH_KEY: ${{ secrets.JUMP_HOST_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JUMP_HOST_SSH_KEY:-}" ]; then
+            echo "::error::JUMP_HOST_SSH_KEY secret not configured"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$JUMP_HOST_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 700 ~/.ssh
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Run reachability checks
+        id: checks
+        shell: bash
+        env:
+          TARGET_SET: ${{ github.event.inputs.target_set || 'example-management' }}
+        run: |
+          set -euo pipefail
+          target_file="environments/example/reachability-targets/${TARGET_SET}.yaml"
+          test -f "$target_file"
+          report=/tmp/endpoint-reachability.md
+
+          python3 - <<'PY' > /tmp/endpoint-targets.tsv
+          import os
+          import yaml
+          from pathlib import Path
+
+          target_set = os.environ["TARGET_SET"]
+          data = yaml.safe_load(Path(f"environments/example/reachability-targets/{target_set}.yaml").read_text())
+          sources = data["sources"]
+          for target in data["targets"]:
+              source = sources[target["source"]]
+              print("\t".join([
+                  target["name"],
+                  target.get("description", target["name"]),
+                  source["ssh_user"],
+                  source["host"],
+                  target["host"],
+                  str(target["port"]),
+                  target.get("https_path", ""),
+              ]))
+          PY
+
+          {
+            echo "# Endpoint reachability: ${TARGET_SET}"
+            echo ""
+            echo "Generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo ""
+          } > "$report"
+
+          while IFS=$'\t' read -r name description ssh_user source_host target_host target_port https_path; do
+            {
+              echo "## ${name}: ${description}"
+              echo ""
+              echo "- Source: ${ssh_user}@${source_host}"
+              echo "- Target: ${target_host}:${target_port}${https_path}"
+              echo ""
+              echo '```'
+              if ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${ssh_user}@${source_host}" \
+                "test -x /usr/local/bin/test-endpoint-target" >/dev/null 2>&1; then
+                ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${ssh_user}@${source_host}" \
+                  "test-endpoint-target '${target_host}' '${target_port}' '${https_path}'" 2>&1 || true
+              else
+                echo "source endpoint VM not reachable or test helper not installed yet"
+              fi
+              echo '```'
+              echo ""
+            } >> "$report"
+          done < /tmp/endpoint-targets.tsv
+
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo 'markdown<<EOF'
+            cat "$report"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send Webex report
+        if: always()
+        shell: bash
+        env:
+          WEBEX_BOT_TOKEN: ${{ secrets.WEBEX_BOT_TOKEN }}
+          WEBEX_TO_PERSON_EMAIL: ${{ github.event.inputs.to_person_email }}
+          MARKDOWN: ${{ steps.checks.outputs.markdown }}
+        run: |
+          set -euo pipefail
+          [ -n "${WEBEX_BOT_TOKEN:-}" ] || exit 0
+          [ -n "${WEBEX_TO_PERSON_EMAIL:-}" ] || exit 0
+          jq -n --arg email "$WEBEX_TO_PERSON_EMAIL" --arg md "$MARKDOWN" '{toPersonEmail: $email, markdown: $md}' \
+            | curl -fsS --max-time 10 \
+                -X POST "https://webexapis.com/v1/messages" \
+                -H "Authorization: Bearer ${WEBEX_BOT_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d @- >/dev/null

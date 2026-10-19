@@ -1,0 +1,184 @@
+---
+- name: Configure endpoint test VMs
+  hosts: endpoint_test_vms
+  become: true
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../../environments/{{ env }}/group_vars.yml"
+
+  pre_tasks:
+    - name: Wait for SSH to become available
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Gather facts after SSH is ready
+      ansible.builtin.setup:
+
+  tasks:
+    - name: Disable automatic apt updates
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        mode: '0644'
+        content: |
+          APT::Periodic::Update-Package-Lists "0";
+          APT::Periodic::Unattended-Upgrade "0";
+
+    - name: Disable apt periodic jobs
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99disable-periodic
+        mode: '0644'
+        content: |
+          APT::Periodic::Enable "0";
+          APT::Periodic::Update-Package-Lists "0";
+          APT::Periodic::Download-Upgradeable-Packages "0";
+          APT::Periodic::AutocleanInterval "0";
+          APT::Periodic::Unattended-Upgrade "0";
+
+    - name: Stop and mask automatic apt services and timers
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        masked: true
+      loop:
+        - apt-daily.service
+        - apt-daily.timer
+        - apt-daily-upgrade.service
+        - apt-daily-upgrade.timer
+        - unattended-upgrades.service
+      failed_when: false
+
+    - name: Reset failed state for masked apt units
+      ansible.builtin.command:
+        cmd: systemctl reset-failed apt-daily.service apt-daily.timer apt-daily-upgrade.service apt-daily-upgrade.timer unattended-upgrades.service
+      changed_when: false
+      failed_when: false
+
+    - name: Install validation utilities
+      ansible.builtin.apt:
+        name:
+          - curl
+          - dnsutils
+          - iperf3
+          - iproute2
+          - iputils-ping
+          - jq
+          - mtr-tiny
+          - netcat-openbsd
+          - nmap
+          - openssl
+          - tcpdump
+          - traceroute
+        update_cache: true
+        state: present
+
+    - name: Create validation tools staging directory
+      ansible.builtin.file:
+        path: /tmp/example-validation-tools
+        state: directory
+        mode: "0755"
+
+    - name: Download OpenShift client tools
+      ansible.builtin.unarchive:
+        src: "{{ runner_vm_tools_openshift_client_url }}"
+        dest: /tmp/example-validation-tools
+        remote_src: true
+        include:
+          - oc
+          - kubectl
+
+    - name: Install OpenShift client tools
+      ansible.builtin.copy:
+        src: "/tmp/example-validation-tools/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        mode: "0755"
+        remote_src: true
+      loop:
+        - oc
+        - kubectl
+
+    - name: Check endpoint validation tooling
+      ansible.builtin.shell:
+        cmd: "command -v {{ item }}"
+      loop:
+        - curl
+        - dig
+        - ip
+        - iperf3
+        - jq
+        - kubectl
+        - mtr
+        - nc
+        - nmap
+        - oc
+        - openssl
+        - ping
+        - tcpdump
+        - tracepath
+        - traceroute
+      changed_when: false
+
+    - name: Write generic endpoint reachability helper
+      ansible.builtin.copy:
+        dest: /usr/local/bin/test-endpoint-target
+        mode: '0755'
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+            echo "usage: $0 <host-or-ip> <port> [https-path]" >&2
+            exit 2
+          fi
+
+          target="$1"
+          port="$2"
+          path="${3:-}"
+          safe_name="${target//[^A-Za-z0-9_.-]/_}-${port}"
+
+          echo "== path to ${target} =="
+          tracepath -n "$target" || traceroute -n "$target" || true
+          echo "== tcp ${target}:${port} =="
+          nc -vz -w 5 "$target" "$port"
+          echo "== tls ${target}:${port} =="
+          timeout 10 openssl s_client -connect "${target}:${port}" -servername "${target}" </dev/null >"/tmp/${safe_name}-openssl.out" 2>&1 || true
+          awk '/Protocol|Cipher|Verify return code|subject=|issuer=/ {print}' "/tmp/${safe_name}-openssl.out" || true
+          if [ -n "$path" ]; then
+            echo "== https ${target}:${port}${path} =="
+            curl -k --connect-timeout 5 --max-time 10 "https://${target}:${port}${path}"
+          fi
+
+    - name: Configure tenant API VIP routes
+      ansible.builtin.copy:
+        dest: /etc/netplan/80-tenant-api-routes.yaml
+        mode: '0644'
+        content: |
+          network:
+            version: 2
+            ethernets:
+              ens224:
+                routes:
+                  - to: 198.18.11.17/32
+                    via: 198.18.12.65
+              ens256:
+                routes:
+                  - to: 198.18.13.18/32
+                    via: 198.18.14.65
+
+    - name: Apply tenant API VIP routes
+      ansible.builtin.command:
+        cmd: netplan apply
+      changed_when: false
+
+    - name: Write hosted API compatibility wrapper
+      ansible.builtin.copy:
+        dest: /usr/local/bin/test-hosted-api-vip
+        mode: '0755'
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [ "$#" -ne 1 ]; then
+            echo "usage: $0 <vip>" >&2
+            exit 2
+          fi
+          exec /usr/local/bin/test-endpoint-target "$1" 6443 /version

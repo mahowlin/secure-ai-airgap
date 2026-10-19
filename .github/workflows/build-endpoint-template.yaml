@@ -1,0 +1,239 @@
+name: 'Build Endpoint VM Template'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        type: choice
+        options:
+          - example
+        default: example
+      action:
+        description: 'Pipeline action'
+        required: true
+        default: validate
+        type: choice
+        options:
+          - validate
+          - deploy
+      force_rebuild:
+        description: 'Force rebuild (-force flag)'
+        type: boolean
+        default: false
+      template_version:
+        description: 'Template version suffix; leave empty for UTC timestamp YYYYMMDD-HHMMSS'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: 'Validate Packer endpoint template'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    defaults:
+      run:
+        working-directory: packer/ubuntu-2404
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve template name
+        id: template
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.template_version }}"
+          if [ -z "$version" ]; then
+            version="$(date -u +'%Y%m%d-%H%M%S')"
+          fi
+          case "$version" in
+            *[!A-Za-z0-9_.-]*|'')
+              echo "::error::template_version may only contain letters, numbers, dot, underscore, and hyphen"
+              exit 1
+              ;;
+          esac
+          name="example-ubuntu-2404-endpoint-${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "../../environments/${{ inputs.environment }}/packer/endpoint-template.pkrvars.hcl"
+
+      - name: Packer fmt check
+        run: packer fmt -check .
+
+      - name: Prepare private endpoint build references
+        shell: bash
+        env:
+          ENDPOINT_BUILD_PASSWORD: ${{ secrets.ENDPOINT_BUILD_PASSWORD }}
+          ENDPOINT_SSH_AUTHORIZED_KEYS: ${{ secrets.ENDPOINT_SSH_AUTHORIZED_KEYS }}
+        run: |
+          set -euo pipefail
+          input_dir=$(mktemp -d "$RUNNER_TEMP/endpoint-input.XXXXXX")
+          trap 'rm -rf -- "$input_dir"' ERR
+          export ENDPOINT_PRIVATE_INPUT="$input_dir/build.pkrvars.json"
+          python3 ../../scripts/prepare-endpoint-build-input.py
+          echo "ENDPOINT_INPUT_DIR=$input_dir" >> "$GITHUB_ENV"
+          echo "ENDPOINT_PRIVATE_INPUT=$ENDPOINT_PRIVATE_INPUT" >> "$GITHUB_ENV"
+
+      - name: Packer init
+        run: packer init .
+
+      - name: Packer validate
+        env:
+          PKR_VAR_vsphere_password: ${{ secrets.VSPHERE_PASSWORD }}
+        run: |
+          packer validate \
+            -var-file="$ENDPOINT_PRIVATE_INPUT" \
+            -var-file="../../environments/${{ inputs.environment }}/packer/endpoint-template.pkrvars.hcl" \
+            .
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Endpoint template validation"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| Environment | ${{ inputs.environment }} |"
+            echo "| Action | ${{ inputs.action }} |"
+            echo "| Template vars | environments/${{ inputs.environment }}/packer/endpoint-template.pkrvars.hcl |"
+            echo "| Resolved template | ${{ steps.template.outputs.name }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove private build input
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${ENDPOINT_INPUT_DIR:-}" ]; then
+            rm -rf -- "$ENDPOINT_INPUT_DIR"
+          fi
+
+  deploy:
+    name: 'Deploy Packer endpoint template'
+    needs: validate
+    if: inputs.action == 'deploy'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    defaults:
+      run:
+        working-directory: packer/ubuntu-2404
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve template name
+        id: template
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.template_version }}"
+          if [ -z "$version" ]; then
+            version="$(date -u +'%Y%m%d-%H%M%S')"
+          fi
+          case "$version" in
+            *[!A-Za-z0-9_.-]*|'')
+              echo "::error::template_version may only contain letters, numbers, dot, underscore, and hyphen"
+              exit 1
+              ;;
+          esac
+          name="example-ubuntu-2404-endpoint-${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare private endpoint build references
+        shell: bash
+        env:
+          ENDPOINT_BUILD_PASSWORD: ${{ secrets.ENDPOINT_BUILD_PASSWORD }}
+          ENDPOINT_SSH_AUTHORIZED_KEYS: ${{ secrets.ENDPOINT_SSH_AUTHORIZED_KEYS }}
+        run: |
+          set -euo pipefail
+          input_dir=$(mktemp -d "$RUNNER_TEMP/endpoint-input.XXXXXX")
+          trap 'rm -rf -- "$input_dir"' ERR
+          export ENDPOINT_PRIVATE_INPUT="$input_dir/build.pkrvars.json"
+          python3 ../../scripts/prepare-endpoint-build-input.py
+          echo "ENDPOINT_INPUT_DIR=$input_dir" >> "$GITHUB_ENV"
+          echo "ENDPOINT_PRIVATE_INPUT=$ENDPOINT_PRIVATE_INPUT" >> "$GITHUB_ENV"
+
+      - name: Packer init
+        run: packer init .
+
+      - name: Packer deploy
+        shell: bash
+        env:
+          PKR_VAR_vsphere_password: ${{ secrets.VSPHERE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          unset PACKER_LOG PACKER_LOG_PATH
+          force_arg=""
+          if [[ "${{ inputs.force_rebuild }}" == "true" ]]; then
+            force_arg="-force"
+          fi
+          packer build \
+            -var-file="$ENDPOINT_PRIVATE_INPUT" \
+            -on-error=cleanup \
+            ${force_arg} \
+            -var "vm_name=${{ steps.template.outputs.name }}" \
+            -var-file="../../environments/${{ inputs.environment }}/packer/endpoint-template.pkrvars.hcl" \
+            .
+
+
+      - name: Remove private build input
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${ENDPOINT_INPUT_DIR:-}" ]; then
+            rm -rf -- "$ENDPOINT_INPUT_DIR"
+          fi
+
+  test:
+    name: 'Test endpoint template metadata'
+    needs:
+      - validate
+      - deploy
+    if: always() && (inputs.action == 'validate' || needs.deploy.result == 'success')
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate template wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+          vars_file="environments/${{ inputs.environment }}/packer/endpoint-template.pkrvars.hcl"
+          deploy_file="environments/${{ inputs.environment }}/vsphere-vms/tenant-endpoint-test-vms.tfvars"
+          template_name=$(awk -F'"' '/^vm_name[[:space:]]*=/{print $2}' "$vars_file")
+          test -n "$template_name"
+          grep -Eq 'vsphere_template[[:space:]]*=[[:space:]]*"example-ubuntu-2404-endpoint-.+"' "$deploy_file"
+          grep -q 'traceroute' packer/ubuntu-2404/ubuntu-2404.pkr.hcl
+          grep -q 'netcat-openbsd' packer/ubuntu-2404/ubuntu-2404.pkr.hcl
+          grep -q '99disable-periodic' packer/ubuntu-2404/ubuntu-2404.pkr.hcl
+          {
+            echo "## Endpoint template test"
+            echo ""
+            echo "| Check | Result |"
+            echo "|-------|--------|"
+            echo "| Base template name | ${template_name} |"
+            echo "| Deploy VM set references versioned endpoint template | pass |"
+            echo "| Endpoint tools installed in template | pass |"
+            echo "| Automatic apt jobs disabled in template | pass |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,132 @@
+name: HCP oc-mirror-operator bootstrap images
+
+# One bounded upstream-to-site registry producer. The released operator later owns
+# site registry-to-hosted-cache reconciliation; this workflow never writes that cache.
+on:
+  workflow_dispatch:
+    inputs:
+      artifacts_only:
+        description: Prepare verified inspection inputs without registry writes
+        type: boolean
+        default: false
+      artifact_source_path:
+        description: Optional staged upstream-layout cache for disconnected preparation
+        type: string
+        required: false
+      environment:
+        description: Explicit environments/<name> execution profile
+        required: true
+        type: string
+      project_contract:
+        description: Optional generated metadata.yaml staged by the owning pipeline
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcp-oc-mirror-operator-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  prepare-artifacts:
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare selected operator inspection inputs
+        uses: ./.github/actions/prepare-operator-inputs
+        with:
+          contract: ${{ github.workspace }}/mirror/package-inputs/hcp-oc-mirror-operator/source-artifact-contract.json
+          output: ${{ runner.temp }}/oc-mirror-operator-inputs
+          source-root: ${{ inputs.artifact_source_path }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oc-mirror-operator-inputs
+          path: ${{ runner.temp }}/oc-mirror-operator-inputs/
+  mirror:
+    needs: prepare-artifacts
+    if: inputs.artifacts_only != true
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    env:
+      PROFILE_NAME: ${{ inputs.environment }}
+      PROJECT_CONTRACT: ${{ inputs.project_contract }}
+      LEGACY_REGISTRY_OVERRIDE: ${{ vars.OCP_REGISTRY_URL }}
+      REGISTRY_AUTH_JSON: ${{ secrets.REDHAT_PULL_SECRET }}
+      CRANE_VERSION: 0.22.0
+      CRANE_ARCHIVE_SHA256: edb74d53fad9a596860f59d1c5d04a43dfb5f441dc71f57060dd0bf39483c833
+      OPERATOR_CONTRACT: mirror/package-inputs/hcp-oc-mirror-operator/contract.json
+      OPERATOR_VALIDATOR: mirror/package-inputs/hcp-oc-mirror-operator/validate-contract.py
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate bootstrap contract and graph verifier fixtures
+        shell: bash
+        run: |
+          python3 -m unittest discover -s tests -p test_oc_mirror_contract.py
+          python3 -m unittest discover -s tests -p test_hcp_oc_mirror_graph.py
+      - name: Resolve selected registry input
+        id: contract
+        shell: bash
+        run: python3 scripts/read-registry-contract.py --output "$GITHUB_OUTPUT"
+      - name: Install pinned crane with normal TLS roots
+        shell: bash
+        env:
+          LOCAL_REGISTRY: ${{ steps.contract.outputs.registry }}
+        run: |
+          set -euo pipefail
+          test -n "$LOCAL_REGISTRY"
+          test -n "$REGISTRY_AUTH_JSON"
+          ca_path=$(python3 "$OPERATOR_VALIDATOR" --contract "$OPERATOR_CONTRACT" \
+            --expected-registry "$LOCAL_REGISTRY" --emit ca)
+          mkdir -p "$RUNNER_TEMP/hcp-operator-auth" "$RUNNER_TEMP/hcp-operator-bin"
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/hcp-operator-auth" >> "$GITHUB_ENV"
+          printf '%s' "$REGISTRY_AUTH_JSON" > "$RUNNER_TEMP/hcp-operator-auth/config.json"
+          chmod 0600 "$RUNNER_TEMP/hcp-operator-auth/config.json"
+          system_bundle=''
+          for path in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+            if test -s "$path"; then system_bundle="$path"; break; fi
+          done
+          test -n "$system_bundle"
+          cp -f "$system_bundle" "$RUNNER_TEMP/hcp-operator-ca.pem"
+          if test -n "$ca_path"; then cat "$ca_path" >> "$RUNNER_TEMP/hcp-operator-ca.pem"; fi
+          echo "SSL_CERT_FILE=$RUNNER_TEMP/hcp-operator-ca.pem" >> "$GITHUB_ENV"
+          archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
+          curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            --output "$archive"
+          echo "$CRANE_ARCHIVE_SHA256  $archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP/hcp-operator-bin" crane
+          tool_version=$("$RUNNER_TEMP/hcp-operator-bin/crane" version)
+          test "${tool_version#v}" = "$CRANE_VERSION"
+          echo "$RUNNER_TEMP/hcp-operator-bin" >> "$GITHUB_PATH"
+      - name: Copy only pinned release images to site registry
+        shell: bash
+        env:
+          LOCAL_REGISTRY: ${{ steps.contract.outputs.registry }}
+        run: |
+          set -euo pipefail
+          image_list="$RUNNER_TEMP/hcp-operator-images.tsv"
+          receipt_dir="$RUNNER_TEMP/hcp-operator-receipts"
+          mkdir -p "$receipt_dir"
+          python3 "$OPERATOR_VALIDATOR" --contract "$OPERATOR_CONTRACT" \
+            --expected-registry "$LOCAL_REGISTRY" --emit images > "$image_list"
+          while IFS=$'\t' read -r source target expected; do
+            python3 mirror/package-inputs/hcp-oc-mirror-operator/verify-image.py \
+              --source "$source" --destination "$target" --digest "$expected" \
+              --receipt "$receipt_dir/${expected#sha256:}.json"
+          done < "$image_list"
+      - name: Preserve non-secret graph verification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcp-operator-bootstrap-receipts
+          path: ${{ runner.temp }}/hcp-operator-receipts/*.json
+          if-no-files-found: warn
+      - name: Remove temporary authentication
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/hcp-operator-auth/config.json"

@@ -1,7 +1,3 @@
-# Copyright (c) 2026 Cisco and/or its affiliates.
-# Licensed under the Cisco Sample Code License, Version 1.1
-# See LICENSE in the project root.
-
 ---
 # SAIF environment group variables
 # Used by ansible/playbooks/configure-runner.yaml
@@ -16,13 +12,23 @@ data_mount_point: /data
 # Docker Configuration
 # =============================================================================
 docker_version: "5:29.1.3-1~ubuntu.24.04~noble"
+docker_data_root: "{{ data_mount_point }}/docker"
+docker_insecure_registries: []
+containerd_root: "{{ data_mount_point }}/containerd"
 
 # =============================================================================
 # Container Registry Configuration
 # =============================================================================
+registry_dns_name: "registry.example.com"
 registry_port: "5000"
 registry_data_dir: "{{ data_mount_point }}/registry"
 registry_image_tag: "2.8.3"
+registry_log_driver: "json-file"
+registry_log_max_size: "1g"
+registry_log_max_files: "4"
+# Retire only the known 2026-01-22 job; leave its script inert for audit.
+runner_legacy_cleanup_cron_path: "/etc/cron.d/cleanup-storage"
+runner_legacy_cleanup_cron_state: "absent"
 
 # =============================================================================
 # Web Server Configuration (nginx with WebDAV)
@@ -38,11 +44,42 @@ tfstate_port: "8081"
 tfstate_data_dir: "{{ data_mount_point }}/tfstate"
 tfstate_image: "ghcr.io/nimbolus/terraform-backend"
 tfstate_image_tag: "latest"
+tfstate_image_digest: "sha256:8975a0f92994dff0634e25a6be829584fbf00b96979b2027007ef6840c57017e"
+
+# =============================================================================
+# RustFS S3-Compatible Object Storage (Timescape ingest target)
+# =============================================================================
+# Last known running version; use the local image or pull only this immutable digest.
+rustfs_image_ref: "rustfs/rustfs@sha256:6bd08dc511cebe0a4b5c35c266db465c7eb92cf3df4321c69967be66fe4cb395"
+rustfs_container_name: "rustfs-server"
+rustfs_cli_image: "amazon/aws-cli"
+rustfs_cli_image_tag: "2.32.3"
+rustfs_api_port: "9000"
+rustfs_console_port: "9001"
+rustfs_console_expose: false
+rustfs_dns_name: "timescape-s3.example.com"
+rustfs_endpoint_url: "http://timescape-s3.example.com:9000"
+rustfs_bucket: "saif-timescape"
+rustfs_data_dir: "{{ data_mount_point }}/rustfs/data"
+rustfs_logs_dir: "{{ data_mount_point }}/rustfs/logs"
+rustfs_timescape_prefix_dir: "{{ rustfs_data_dir }}/{{ rustfs_bucket }}/hubble-events"
+rustfs_retention_hours: 4
+rustfs_max_bucket_gib: 80
+rustfs_cleanup_interval_minutes: 15
+rustfs_cleanup_script: "/usr/local/sbin/example-rustfs-timescape-cleanup"
+rustfs_cleanup_log: "/var/log/example-rustfs-timescape-cleanup.log"
+rustfs_cleanup_log_retention_days: 14
+# Keep the 80% runner warning, but leave room for the 80GiB bucket before stopping RustFS.
+rustfs_critical_data_percent: 90
+rustfs_target_data_percent: 70
+rustfs_stop_on_critical_usage: true
+rustfs_access_key: "{{ lookup('env', 'RUSTFS_ACCESS_KEY') | default('', true) }}"
+rustfs_secret_key: "{{ lookup('env', 'RUSTFS_SECRET_KEY') | default('', true) }}"
 
 # =============================================================================
 # HTTP Authentication (shared by nginx and terraform-backend)
 # =============================================================================
-http_auth_user: "admin"
+http_auth_user: "example"
 # http_auth_password: Set via --extra-vars at runtime or Ansible Vault
 
 # =============================================================================
@@ -54,25 +91,82 @@ gitea_ssh_port: "2222"
 gitea_data_dir: "{{ data_mount_point }}/gitea"
 gitea_domain: "gitea.example.com"
 gitea_root_url: "http://gitea.example.com:3000"
-gitea_admin_user: "admin"
+gitea_admin_user: "example"
 gitea_admin_email: "admin@example.com"
 # gitea_admin_password: Set via --extra-vars at runtime or Ansible Vault
 gitea_org_name: "mahowlin"
 gitea_repo_name: "saif-gitops"
 
 # =============================================================================
-# GitHub Actions Runner Configuration (DinD)
+# GitHub Actions Runner Configuration (DooD-style Docker socket runners)
 # =============================================================================
-runner_count: 3
-runner_image_tag: "latest"
+runner_count: 5
+runner_image_tag: "2.336.0"
+runner_image_digest: "sha256:fc28f4cd67cacf3024984d873b2adbbd5809b85095747fa3fcd2421c098fb846"
+runner_image_ref: "myoung34/github-runner@{{ runner_image_digest }}"
+runner_config_dir: "{{ data_mount_point }}/runner-config"
+# Execution-specific registration profile; independent of a tenant's GitOps source.
 github_org: "mahowlin"
+github_repository: "secure-ai-airgap"
+runner_scope: "repo"
+github_runner_api_path: "{{ ('repos/' ~ github_org ~ '/' ~ github_repository if runner_scope == 'repo' else 'orgs/' ~ github_org) ~ '/actions/runners' }}"
+github_runner_url: "{{ 'https://github.com/' ~ github_org ~ ('/' ~ github_repository if runner_scope == 'repo' else '') }}"
+runner_token: "{{ lookup('env', 'RUNNER_TOKEN') | default('', true) }}"
 github_runner_labels: "self-hosted,linux,saif-github-runner"
 # runner_token: Set via --extra-vars at runtime
 #   RUNNER_TOKEN=$(gh api -X POST /orgs/mahowlin/actions/runners/registration-token --jq '.token')
 
 # =============================================================================
+# Runner VM Demo / Validation Tooling
+# =============================================================================
+runner_vm_tools_openshift_client_version: "4.19.21"
+runner_vm_tools_openshift_client_url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/{{ runner_vm_tools_openshift_client_version }}/openshift-client-linux-{{ runner_vm_tools_openshift_client_version }}.tar.gz"
+runner_vm_tools_cilium_cli_version: "v0.18.7"
+runner_vm_tools_cilium_cli_url: "https://github.com/cilium/cilium-cli/releases/download/{{ runner_vm_tools_cilium_cli_version }}/cilium-linux-amd64.tar.gz"
+runner_vm_tools_hubble_cli_version: "v1.18.0"
+runner_vm_tools_hubble_cli_url: "https://github.com/cilium/hubble/releases/download/{{ runner_vm_tools_hubble_cli_version }}/hubble-linux-amd64.tar.gz"
+runner_vm_tools_yq_version: "v4.45.4"
+runner_vm_tools_yq_url: "https://github.com/mikefarah/yq/releases/download/{{ runner_vm_tools_yq_version }}/yq_linux_amd64"
+
+# =============================================================================
+# Time Synchronization Configuration
+# =============================================================================
+runner_vm_ntp_servers:
+  - 198.19.49.151
+
+# =============================================================================
+# Health Check Configuration
+# =============================================================================
+runner_vm_health_script: /usr/local/sbin/saif-runner-vm-health.sh
+runner_vm_health_log: /var/log/saif-runner-vm-health.log
+runner_vm_data_warn_percent: 80
+runner_vm_data_crit_percent: 90
+runner_vm_expected_runners: 5
+# Optional shell command executed by the health script only when a critical check fails.
+# Keep empty until /etc/saif-runner-vm-health.env exists with alert credentials.
+runner_vm_health_alert_command: "/usr/local/sbin/saif-runner-vm-health-alert.sh"
+runner_vm_health_alert_script: /usr/local/sbin/saif-runner-vm-health-alert.sh
+runner_vm_health_alert_env: /etc/saif-runner-vm-health.env
+
+# =============================================================================
+# Standby Backup Configuration
+# =============================================================================
+runner_vm_standby_host: 10.0.0.158
+runner_vm_standby_user: ubuntu
+runner_vm_backup_script: /usr/local/sbin/saif-runner-vm-backup-sync.sh
+runner_vm_backup_log: /var/log/saif-runner-vm-backup-sync.log
+runner_vm_backup_retention_days: 14
+
+# =============================================================================
 # Notes
 # =============================================================================
-# CI/CD tools (Terraform, oc, kubectl, etc.) are provided via the
-# github-actions-container image used in workflow container: directive,
-# not installed on the runner VM.
+# Most CI/CD tools are provided via the github-actions-container image used
+# in workflow container directives. The tools tag installs only the small
+# on-VM demo/validation CLIs needed to test SITE Lab connectivity directly
+# from the runner VM.
+
+# Runner maintenance ownership and executor boundary.
+runner_container_name_prefix: runner-
+runner_name_prefix: saif-runner-
+runner_managed_by: saif-sys-admin
+runner_docker_socket_path: /var/run/docker.sock

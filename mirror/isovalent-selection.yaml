@@ -1,0 +1,19 @@
+# Selected public source/consumer releases; caBundle empty uses system trust.
+imageSet: mirror/isovalent-images.yaml
+contracts:
+- path: mirror/releases/clife-1.19.7.yaml
+  mode: package-only
+- path: mirror/releases/iep-26.05.yaml
+  mode: full
+destination:
+  registry: registry.example.com:5000
+  caBundle: ''
+runtimeImages:
+- quay.io/isovalent/hubble-timescape:v1.18.1
+- quay.io/isovalent/hubble-timescape:v1.18.2
+- quay.io/isovalent/hubble-timescape-ui:v1.18.2
+- quay.io/isovalent/hubble-k8s-exporter:v1.18.2
+- quay.io/isovalent/hubble-k8s-exporter:v1.19.0-rc.2
+- quay.io/isovalent/clickhouse-server:25.8.12.129-alpine
+- quay.io/isovalent/certgen:v0.2.4
+- quay.io/isovalent/vector:0.51.0-distroless-libc

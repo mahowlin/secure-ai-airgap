@@ -1,7 +1,3 @@
-# Copyright (c) 2026 Cisco and/or its affiliates.
-# Licensed under the Cisco Sample Code License, Version 1.1
-# See LICENSE in the project root.
-
 ---
 # Ansible Playbook: Configure Runner VM (Ubuntu 24.04)
 # Purpose: Install and configure GitHub Actions DinD runners, container registry, and web server
@@ -9,16 +5,173 @@
 # Prerequisites:
 #   ansible-galaxy collection install -r requirements.yml
 #
-# Usage:
-#   RUNNER_TOKEN=$(gh api -X POST /orgs/mahowlin/actions/runners/registration-token --jq '.token')
-#   ansible-playbook -i ../environments/example/hosts.ini configure-runner.yaml \
-#     --extra-vars "runner_token=${RUNNER_TOKEN}"
+# Usage (owning pipeline only for rollout):
+#   ansible-playbook -i environments/<site>/hosts.ini ansible/playbooks/configure-runner.yaml -e env=<site>
+# RUNNER_TOKEN is supplied privately by the pipeline; no token CLI argument.
 
 - name: Configure Runner VM for AI Pod Deployment
   hosts: runner
   become: true
   vars_files:
-    - "{{ playbook_dir }}/../../environments/{{ env | default('example') }}/group_vars.yml"
+    - "{{ playbook_dir }}/../../environments/{{ env }}/group_vars.yml"
+
+  vars:
+    runner_token: '{{ lookup(''ansible.builtin.env'', ''RUNNER_TOKEN'') }}'
+    http_auth_password: '{{ lookup(''ansible.builtin.env'', ''HTTP_SERVER_PASSWORD'')
+      }}'
+    gitea_admin_password: '{{ lookup(''ansible.builtin.env'', ''GITEA_ADMIN_PASSWORD'')
+      }}'
+    runner_executor_name: '{{ lookup(''ansible.builtin.env'', ''RUNNER_NAME'') }}'
+    runner_tasks_selected: '{{ ''runner'' not in ansible_skip_tags and (''all'' in ansible_run_tags
+      or ''tagged'' in ansible_run_tags or ''runner'' in ansible_run_tags) }}'
+
+  pre_tasks:
+    - name: Load selected project contract when composing with datacenter
+      ansible.builtin.include_vars:
+        file: "{{ project_contract_file }}"
+        name: selected_project
+      when: project_contract_file is defined
+      tags: [always]
+
+    - name: Check selected project contract joins
+      ansible.builtin.assert:
+        that:
+          - selected_project.platformServices.registry == selected_project.imageDelivery.registry
+          - selected_project.platformServices.registryTrustPolicy == selected_project.registryTrustPolicy
+          - selected_project.platformServices.ntpServers | length > 0
+          - selected_project.platformServices.dnsServers | length > 0
+          - selected_project.platformServices.registry.split(':') | length == 2
+          - selected_project.ocpVersion is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+        fail_msg: Selected project contract is missing or conflicts internally; regenerate canonical inputs.
+      when: project_contract_file is defined
+      tags: [always]
+
+    - name: Apply canonical shared facts over standalone profile defaults
+      ansible.builtin.set_fact:
+        registry_dns_name: "{{ selected_project.platformServices.registry.split(':')[0] }}"
+        registry_port: "{{ selected_project.platformServices.registry.split(':')[1] }}"
+        runner_vm_ntp_servers: "{{ selected_project.platformServices.ntpServers }}"
+        runner_vm_tools_openshift_client_version: "{{ selected_project.ocpVersion }}"
+      when: project_contract_file is defined
+      tags: [always]
+
+    - name: Reject conflicting explicit runtime overrides of shared project facts
+      ansible.builtin.assert:
+        that:
+          - registry_dns_name == selected_project.platformServices.registry.split(':')[0]
+          - registry_port | string == selected_project.platformServices.registry.split(':')[1]
+          - runner_vm_ntp_servers == selected_project.platformServices.ntpServers
+          - runner_vm_tools_openshift_client_version == selected_project.ocpVersion
+        fail_msg: Explicit runtime override conflicts with generated project selection; edit canonical input and regenerate.
+      when: project_contract_file is defined
+      tags: [always]
+
+    - name: Apply selected object store contract when declared
+      ansible.builtin.set_fact:
+        rustfs_endpoint_url: "{{ selected_project.platformServices.objectStore.endpoint }}"
+        rustfs_bucket: "{{ selected_project.platformServices.objectStore.bucket }}"
+        rustfs_dns_name: "{{ selected_project.platformServices.objectStore.endpoint | urlsplit('hostname') }}"
+        rustfs_api_port: "{{ selected_project.platformServices.objectStore.endpoint | urlsplit('port') }}"
+      when: project_contract_file is defined and selected_project.platformServices.objectStore is defined
+      tags: [always]
+
+    - name: Reject conflicting object store overrides
+      ansible.builtin.assert:
+        that:
+          - rustfs_endpoint_url == selected_project.platformServices.objectStore.endpoint
+          - rustfs_bucket == selected_project.platformServices.objectStore.bucket
+          - rustfs_dns_name == (selected_project.platformServices.objectStore.endpoint | urlsplit('hostname'))
+          - rustfs_api_port | int == (selected_project.platformServices.objectStore.endpoint | urlsplit('port'))
+        fail_msg: Object store runtime override conflicts with canonical project selection.
+      when: project_contract_file is defined and selected_project.platformServices.objectStore is defined
+      tags: [always]
+
+    - name: Validate standalone runner registration profile
+      ansible.builtin.assert:
+        that:
+          - runner_scope in ['repo', 'org']
+          - github_runner_api_path is match('^(repos|orgs)/[A-Za-z0-9_.-]+/')
+          - registry_dns_name is match('^[A-Za-z0-9.-]+$')
+          - github_runner_api_path == (('repos/' ~ github_org ~ '/' ~ github_repository if runner_scope == 'repo' else 'orgs/' ~ github_org) ~ '/actions/runners')
+          - github_runner_url == ('https://github.com/' ~ github_org ~ ('/' ~ github_repository if runner_scope == 'repo' else ''))
+      tags: [always]
+
+    - name: Require selected webserver private runtime reference
+      ansible.builtin.assert:
+        that: [http_auth_password | default('') | length > 0]
+        fail_msg: HTTP_SERVER_PASSWORD is required for webserver configuration
+        quiet: true
+      when: "'all' in ansible_run_tags or 'tagged' in ansible_run_tags or 'webserver' in ansible_run_tags"
+      no_log: true
+      tags: [always]
+
+    - name: Require selected Gitea private runtime reference
+      ansible.builtin.assert:
+        that: [gitea_admin_password | default('') | length > 0]
+        fail_msg: GITEA_ADMIN_PASSWORD is required for Gitea configuration
+        quiet: true
+      when: "'all' in ansible_run_tags or 'tagged' in ansible_run_tags or 'gitea' in ansible_run_tags"
+      no_log: true
+      tags: [always]
+
+    - name: Require runner token and observed executor identity
+      ansible.builtin.assert:
+        that:
+          - runner_token | default('') | length > 0
+          - runner_executor_name | default('') | length > 0
+          - runner_managed_by | length > 0
+        fail_msg: Runner replacement needs runtime token, RUNNER_NAME and declared ownership
+        quiet: true
+      when: runner_tasks_selected | bool
+      no_log: true
+      tags: [always]
+
+    - name: Refuse replacement from a selected managed runner
+      ansible.builtin.assert:
+        that: [runner_executor_name != runner_name_prefix ~ (item | string)]
+        fail_msg: Use an independent executor outside the managed runner set
+      loop: "{{ range(1, runner_count + 1) | list }}"
+      when: runner_tasks_selected | bool
+      tags: [always]
+
+    - name: Detect existing Docker daemon without changing host
+      ansible.builtin.stat:
+        path: "{{ runner_docker_socket_path }}"
+      register: runner_docker_socket
+      when: runner_tasks_selected | bool
+      tags: [always]
+
+    - name: Require readable Docker before runner replacement
+      ansible.builtin.assert:
+        that: [runner_docker_socket.stat.exists]
+        fail_msg: Bootstrap host services without the runner tag first; never infer empty ownership from unavailable Docker
+      when: runner_tasks_selected | bool
+      tags: [always]
+
+    - name: Inspect only selected runner container identities before any changes
+      community.docker.docker_container_info:
+        docker_host: "unix://{{ runner_docker_socket_path }}"
+        name: "{{ runner_container_name_prefix }}{{ item }}"
+      loop: "{{ range(1, runner_count + 1) | list }}"
+      register: runner_existing_containers
+      when: runner_tasks_selected | bool
+      no_log: true
+      tags: [always]
+
+    - name: Refuse unrelated or executing existing runner containers
+      ansible.builtin.assert:
+        that:
+          - item.container.Config.Labels.get('managed-by', '') == runner_managed_by
+          - item.container.Config.Labels.get('runner-org', '') == github_org
+          - "('RUNNER_NAME=' ~ runner_executor_name) not in item.container.Config.Env"
+          - "('RUNNER_NAME=' ~ runner_name_prefix ~ (item.item | string)) in item.container.Config.Env"
+        fail_msg: Existing runner ownership/identity is unproven or this is the executor; leave it intact
+        quiet: true
+      loop: "{{ runner_existing_containers.results | default([]) }}"
+      when: runner_tasks_selected | bool and item.exists | default(false)
+      no_log: true
+      tags: [always]
+
 
   handlers:
     - name: Restart nginx container
@@ -26,6 +179,21 @@
         name: webserver-1
         state: started
         restart: true
+
+    - name: Restart containerd service
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+
+    - name: Restart Docker service
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+
+    - name: Restart systemd-timesyncd service
+      ansible.builtin.systemd:
+        name: systemd-timesyncd
+        state: restarted
 
   tasks:
     #--------------------------------------------------------------------------
@@ -66,12 +234,108 @@
         direction: incoming
       tags: [system]
 
+    - name: Install runner VM validation packages
+      ansible.builtin.apt:
+        name:
+          - traceroute
+        state: present
+      tags: [tools]
+
+    - name: Create runner VM tools staging directory
+      ansible.builtin.file:
+        path: /tmp/saif-runner-tools
+        state: directory
+        mode: "0755"
+      tags: [tools]
+
+    - name: Download OpenShift client tools
+      ansible.builtin.unarchive:
+        src: "{{ runner_vm_tools_openshift_client_url }}"
+        dest: /tmp/saif-runner-tools
+        remote_src: true
+        include:
+          - oc
+          - kubectl
+      tags: [tools]
+
+    - name: Install OpenShift client tools
+      ansible.builtin.copy:
+        src: "/tmp/saif-runner-tools/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        mode: "0755"
+        remote_src: true
+      loop:
+        - oc
+        - kubectl
+      tags: [tools]
+
+    - name: Download Cilium CLI
+      ansible.builtin.unarchive:
+        src: "{{ runner_vm_tools_cilium_cli_url }}"
+        dest: /usr/local/bin
+        remote_src: true
+        include:
+          - cilium
+      tags: [tools]
+
+    - name: Download Hubble CLI
+      ansible.builtin.unarchive:
+        src: "{{ runner_vm_tools_hubble_cli_url }}"
+        dest: /usr/local/bin
+        remote_src: true
+        include:
+          - hubble
+      tags: [tools]
+
+    - name: Download yq
+      ansible.builtin.get_url:
+        url: "{{ runner_vm_tools_yq_url }}"
+        dest: /usr/local/bin/yq
+        mode: "0755"
+      tags: [tools]
+
+    - name: Verify runner VM validation tools
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - oc version --client
+        - kubectl version --client=true
+        - cilium version --client
+        - hubble version
+        - yq --version
+        - traceroute --version
+      changed_when: false
+      tags: [tools]
+
     - name: Allow SSH through UFW
       community.general.ufw:
         rule: allow
         port: "22"
         proto: tcp
       tags: [system]
+
+    - name: Create systemd-timesyncd drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/timesyncd.conf.d
+        state: directory
+        mode: "0755"
+      tags: [system, time]
+
+    - name: Configure SITE Lab NTP servers
+      ansible.builtin.copy:
+        dest: /etc/systemd/timesyncd.conf.d/example.conf
+        mode: "0644"
+        content: |
+          [Time]
+          NTP={{ runner_vm_ntp_servers | join(' ') }}
+      notify: Restart systemd-timesyncd service
+      tags: [system, time]
+
+    - name: Start and enable systemd-timesyncd service
+      ansible.builtin.systemd:
+        name: systemd-timesyncd
+        enabled: true
+        state: started
+      tags: [system, time]
 
     #--------------------------------------------------------------------------
     # Docker CE Installation
@@ -108,6 +372,71 @@
           - docker-compose-plugin
         state: present
         update_cache: true
+      tags: [docker]
+
+    - name: Configure containerd data root
+      ansible.builtin.copy:
+        dest: /etc/containerd/config.toml
+        mode: "0644"
+        content: |
+          # Managed by Ansible. Do not edit manually.
+          disabled_plugins = ["cri"]
+
+          root = "{{ containerd_root }}"
+          #state = "/run/containerd"
+          #subreaper = true
+          #oom_score = 0
+
+          #[grpc]
+          #  address = "/run/containerd/containerd.sock"
+          #  uid = 0
+          #  gid = 0
+
+          #[debug]
+          #  address = "/run/containerd/debug.sock"
+          #  uid = 0
+          #  gid = 0
+          #  level = "info"
+      notify: Restart containerd service
+      tags: [docker]
+
+    - name: Configure Docker daemon
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        content: |
+          {
+            "data-root": "{{ docker_data_root }}",
+            "insecure-registries": {{ docker_insecure_registries | to_json }}
+          }
+      notify: Restart Docker service
+      tags: [docker]
+
+    - name: Validate registry retention and exact legacy cleanup inputs
+      ansible.builtin.assert:
+        that:
+          - registry_log_driver == 'json-file'
+          - registry_log_max_size is match('^(?:[1-9][0-9]{0,2}m|[1-4]g)$')
+          - (registry_log_max_files | string) is match('^[2-4]$')
+          - runner_legacy_cleanup_cron_path == '/etc/cron.d/cleanup-storage'
+          - runner_legacy_cleanup_cron_state == 'absent'
+        fail_msg: Registry log retention or legacy cleanup inputs are outside the reviewed bounds
+      become: false
+      tags: [docker, registry, registry-policy-check]
+
+    # The 2026-01-22 cron prunes stopped containers and retained boot ISOs.
+    # Retire its schedule before any capacity cleanup is considered.
+    - name: Disable legacy unmanaged storage cleanup cron
+      ansible.builtin.file:
+        path: "{{ runner_legacy_cleanup_cron_path }}"
+        state: "{{ runner_legacy_cleanup_cron_state }}"
+      tags: [docker, registry]
+
+    - name: Start and enable containerd service
+      ansible.builtin.systemd:
+        name: containerd
+        enabled: true
+        state: started
       tags: [docker]
 
     - name: Start and enable Docker service
@@ -213,8 +542,8 @@
           -keyout {{ data_mount_point }}/certs/registry.key \
           -x509 -days 3650 \
           -out {{ data_mount_point }}/certs/registry.crt \
-          -subj "/CN=registry.example.com" \
-          -addext "subjectAltName=DNS:registry.example.com,IP:{{ ansible_host }}"
+          -subj {{ ("/CN=" ~ registry_dns_name) | quote }} \
+          -addext {{ ("subjectAltName=DNS:" ~ registry_dns_name ~ ",IP:" ~ ansible_host) | quote }}
       when: not registry_cert.stat.exists
       tags: [registry, certs]
 
@@ -234,6 +563,10 @@
         image: "registry:{{ registry_image_tag }}"
         state: started
         restart_policy: always
+        log_driver: "{{ registry_log_driver }}"
+        log_options:
+          max-size: "{{ registry_log_max_size }}"
+          max-file: "{{ registry_log_max_files }}"
         ports:
           - "{{ registry_port }}:5000"
         volumes:
@@ -269,7 +602,7 @@
         name: "{{ http_auth_user }}"
         password: "{{ http_auth_password }}"
         mode: "0644"
-      when: http_auth_password is defined
+      no_log: true
       tags: [webserver]
 
     - name: Pull nginx image
@@ -290,7 +623,14 @@
               listen  [::]:80;
               server_name  localhost;
 
-              # Basic auth for all requests
+              # Unauthenticated liveness endpoint for monitoring.
+              location = /healthz {
+                  access_log off;
+                  auth_basic off;
+                  return 200 "ok\n";
+              }
+
+              # Basic auth for all WebDAV content requests.
               auth_basic "SAIF Platform Services";
               auth_basic_user_file /etc/nginx/.htpasswd;
 
@@ -362,7 +702,7 @@
     - name: Create and start terraform-backend container
       community.docker.docker_container:
         name: terraform-backend
-        image: "{{ tfstate_image }}:{{ tfstate_image_tag }}"
+        image: "{{ tfstate_image }}@{{ tfstate_image_digest }}"
         state: started
         restart_policy: always
         ports:
@@ -376,6 +716,333 @@
           AUTH_BASIC_ENABLED: "true"
           KMS_KEY: "{{ kms_key_result.stdout | trim }}"
       tags: [tfstate]
+
+    #--------------------------------------------------------------------------
+    # RustFS S3-Compatible Object Storage Setup
+    #--------------------------------------------------------------------------
+
+    - name: Validate RustFS credentials are provided when configuring RustFS
+      ansible.builtin.assert:
+        that:
+          - rustfs_access_key | length > 0
+          - rustfs_secret_key | length > 0
+          - rustfs_access_key != 'rustfsadmin'
+          - rustfs_secret_key != 'rustfsadmin'
+        fail_msg: "Set non-default RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY in the workflow environment or Ansible secret source before running the rustfs tag."
+      tags: [rustfs]
+
+    - name: Inspect RustFS data mount
+      ansible.builtin.command: findmnt -no SOURCE,FSTYPE,TARGET {{ data_mount_point }}
+      register: rustfs_mount
+      changed_when: false
+      tags: [rustfs]
+
+    - name: Inspect RustFS disk runway
+      ansible.builtin.command: df -P {{ data_mount_point }}
+      register: rustfs_disk
+      changed_when: false
+      tags: [rustfs]
+
+    - name: Refuse RustFS setup on wrong mount or insufficient runway
+      ansible.builtin.assert:
+        that:
+          - rustfs_mount.stdout.split()[1:] == ['xfs', data_mount_point]
+          - (rustfs_disk.stdout_lines[-1].split()[4] | regex_replace('%', '') | int) < (rustfs_critical_data_percent | int)
+          - (rustfs_disk.stdout_lines[-1].split()[3] | int) > ((rustfs_max_bucket_gib | int) * 1024 * 1024)
+        fail_msg: "RustFS setup requires an XFS data mount, disk below the selected stop threshold, and free space above the bucket cap."
+      tags: [rustfs]
+
+    - name: Open UFW port for RustFS S3 API
+      community.general.ufw:
+        rule: allow
+        port: "{{ rustfs_api_port }}"
+        proto: tcp
+      tags: [rustfs]
+
+    - name: Open UFW port for RustFS console when enabled
+      community.general.ufw:
+        rule: allow
+        port: "{{ rustfs_console_port }}"
+        proto: tcp
+      when: rustfs_console_expose | bool
+      tags: [rustfs]
+
+    - name: Create RustFS host directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "10001"
+        group: "10001"
+        mode: "0750"
+      loop:
+        - "{{ rustfs_data_dir }}"
+        - "{{ rustfs_logs_dir }}"
+      tags: [rustfs, storage]
+
+    - name: Inspect existing RustFS cleanup timer unit
+      ansible.builtin.stat:
+        path: /etc/systemd/system/example-rustfs-timescape-cleanup.timer
+      register: rustfs_timer_unit
+      tags: [rustfs]
+
+    - name: Pause RustFS cleanup timer while replacing the guard
+      ansible.builtin.systemd:
+        name: example-rustfs-timescape-cleanup.timer
+        state: stopped
+      when: rustfs_timer_unit.stat.exists
+      tags: [rustfs]
+
+    - name: Wait for any running RustFS cleanup to finish
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - example-rustfs-timescape-cleanup.service
+          - --property=LoadState
+          - --property=ActiveState
+          - --property=SubState
+          - --property=MainPID
+          - --property=ControlPID
+      register: rustfs_cleanup_state
+      changed_when: false
+      until: >-
+        rustfs_cleanup_state.rc == 0 and
+        'MainPID=0' in rustfs_cleanup_state.stdout_lines and
+        'ControlPID=0' in rustfs_cleanup_state.stdout_lines and
+        (
+          ('LoadState=not-found' in rustfs_cleanup_state.stdout_lines and
+           'ActiveState=inactive' in rustfs_cleanup_state.stdout_lines and
+           'SubState=dead' in rustfs_cleanup_state.stdout_lines) or
+          ('LoadState=loaded' in rustfs_cleanup_state.stdout_lines and
+           (('ActiveState=inactive' in rustfs_cleanup_state.stdout_lines and
+             'SubState=dead' in rustfs_cleanup_state.stdout_lines) or
+            ('ActiveState=failed' in rustfs_cleanup_state.stdout_lines and
+             'SubState=failed' in rustfs_cleanup_state.stdout_lines)))
+        )
+      retries: 10
+      delay: 2
+      tags: [rustfs]
+
+    - name: Install RustFS Timescape cleanup script
+      ansible.builtin.copy:
+        dest: "{{ rustfs_cleanup_script }}"
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          bucket_root="{{ rustfs_data_dir }}/{{ rustfs_bucket }}"
+          prefix="{{ rustfs_timescape_prefix_dir }}"
+          retention_mins=$(( {{ rustfs_retention_hours }} * 60 ))
+          max_bucket_bytes=$(( {{ rustfs_max_bucket_gib }} * 1024 * 1024 * 1024 ))
+          data_crit={{ rustfs_critical_data_percent }}
+          data_target={{ rustfs_target_data_percent }}
+          stop_on_critical={{ rustfs_stop_on_critical_usage | bool | lower }}
+          container="{{ rustfs_container_name }}"
+
+          log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+          bucket_bytes() { du -sb "$bucket_root" 2>/dev/null | awk '{print $1}' || printf '0'; }
+          data_percent() { df -P "{{ data_mount_point }}" | awk 'NR==2 {gsub("%", "", $5); print $5}'; }
+          oldest_file() { find "$prefix" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | head -1 | cut -d' ' -f2-; }
+
+          if [ ! -d "$prefix" ]; then
+            log "OK prefix $prefix absent; nothing to clean"
+            exit 0
+          fi
+
+          expired_count=$(find "$prefix" -type f -mmin +"$retention_mins" -print -delete 2>/dev/null | wc -l | tr -d ' ')
+          find "$prefix" -type d -empty -delete 2>/dev/null || true
+          log "OK deleted ${expired_count} files older than {{ rustfs_retention_hours }}h"
+
+          pruned=0
+          while [ "$(bucket_bytes)" -gt "$max_bucket_bytes" ]; do
+            victim=$(oldest_file)
+            [ -n "$victim" ] || break
+            rm -f -- "$victim"
+            pruned=$((pruned + 1))
+            [ "$pruned" -lt 10000 ] || break
+          done
+          [ "$pruned" -eq 0 ] || log "WARN pruned ${pruned} oldest files to enforce {{ rustfs_max_bucket_gib }}Gi bucket cap"
+
+          emergency_pruned=0
+          while [ "$(data_percent)" -ge "$data_crit" ]; do
+            victim=$(oldest_file)
+            [ -n "$victim" ] || break
+            rm -f -- "$victim"
+            emergency_pruned=$((emergency_pruned + 1))
+            [ "$(data_percent)" -le "$data_target" ] && break
+            [ "$emergency_pruned" -lt 20000 ] || break
+          done
+          [ "$emergency_pruned" -eq 0 ] || log "WARN emergency-pruned ${emergency_pruned} files; {{ data_mount_point }} usage now $(data_percent)%"
+
+          if [ "$(data_percent)" -ge "$data_crit" ] && [ "$stop_on_critical" = "true" ]; then
+            docker stop "$container" >/dev/null 2>&1 || true
+            log "FAIL stopped $container because {{ data_mount_point }} usage remains $(data_percent)% >= ${data_crit}%"
+            exit 1
+          fi
+
+          log "OK bucket_bytes=$(bucket_bytes) data_used=$(data_percent)%"
+      tags: [rustfs]
+
+    - name: Install RustFS Timescape cleanup service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/example-rustfs-timescape-cleanup.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Prune RustFS Timescape object-store data
+          After=docker.service
+
+          [Service]
+          Type=oneshot
+          ExecStart={{ rustfs_cleanup_script }}
+          StandardOutput=append:{{ rustfs_cleanup_log }}
+          StandardError=append:{{ rustfs_cleanup_log }}
+      tags: [rustfs]
+
+    - name: Install RustFS Timescape cleanup timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/example-rustfs-timescape-cleanup.timer
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Run RustFS Timescape cleanup every {{ rustfs_cleanup_interval_minutes }} minutes
+
+          [Timer]
+          OnBootSec=5min
+          OnUnitActiveSec={{ rustfs_cleanup_interval_minutes }}min
+          AccuracySec=1min
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+      tags: [rustfs]
+
+    - name: Install RustFS Timescape log rotation
+      ansible.builtin.copy:
+        dest: /etc/logrotate.d/example-rustfs-timescape
+        mode: "0644"
+        content: |
+          {{ rustfs_cleanup_log }} {
+              daily
+              rotate {{ rustfs_cleanup_log_retention_days }}
+              compress
+              missingok
+              notifempty
+              copytruncate
+          }
+
+          {{ rustfs_logs_dir }}/*.log {
+              daily
+              rotate {{ rustfs_cleanup_log_retention_days }}
+              compress
+              missingok
+              notifempty
+              copytruncate
+          }
+      tags: [rustfs]
+
+    - name: Check corrected RustFS cleanup script syntax
+      ansible.builtin.command:
+        argv: [bash, -n, "{{ rustfs_cleanup_script }}"]
+      changed_when: false
+      tags: [rustfs]
+
+    - name: Verify corrected RustFS cleanup threshold before service restoration
+      ansible.builtin.command:
+        argv: [grep, -Fqx, "data_crit={{ rustfs_critical_data_percent }}", "{{ rustfs_cleanup_script }}"]
+      changed_when: false
+      tags: [rustfs]
+
+    - name: Enable RustFS Timescape cleanup timer
+      ansible.builtin.systemd:
+        name: example-rustfs-timescape-cleanup.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      tags: [rustfs]
+
+    - name: Create and start RustFS container
+      community.docker.docker_container:
+        name: "{{ rustfs_container_name }}"
+        image: "{{ rustfs_image_ref }}"
+        pull: missing
+        state: started
+        restart_policy: always
+        security_opts:
+          - no-new-privileges:true
+        ports: "{{ ([rustfs_api_port ~ ':9000'] + ([rustfs_console_port ~ ':9001'] if (rustfs_console_expose | bool) else ['127.0.0.1:' ~ rustfs_console_port ~ ':9001'])) }}"
+        volumes:
+          - "{{ rustfs_data_dir }}:/data"
+          - "{{ rustfs_logs_dir }}:/logs"
+        env:
+          RUSTFS_VOLUMES: /data
+          RUSTFS_ADDRESS: "0.0.0.0:9000"
+          RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+          RUSTFS_CONSOLE_ENABLE: "true"
+          RUSTFS_ACCESS_KEY: "{{ rustfs_access_key }}"
+          RUSTFS_SECRET_KEY: "{{ rustfs_secret_key }}"
+          RUSTFS_OBS_LOGGER_LEVEL: info
+          RUSTFS_OBS_LOG_DIRECTORY: /logs
+        healthcheck:
+          test:
+            - CMD-SHELL
+            - "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health"
+          interval: 30s
+          timeout: 10s
+          retries: 3
+          start_period: 40s
+      tags: [rustfs]
+
+    - name: Pull AWS CLI image for RustFS bucket bootstrap
+      community.docker.docker_image:
+        name: "{{ rustfs_cli_image }}"
+        tag: "{{ rustfs_cli_image_tag }}"
+        source: pull
+        force_source: false
+      tags: [rustfs]
+
+    - name: Wait for RustFS S3 API health endpoint
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rustfs_api_port }}/health"
+        method: GET
+        status_code: [200]
+      register: rustfs_api_health
+      until: rustfs_api_health.status == 200
+      retries: 30
+      delay: 2
+      tags: [rustfs]
+
+    - name: Create RustFS Timescape bucket
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --network
+          - host
+          - -e
+          - AWS_ACCESS_KEY_ID={{ rustfs_access_key }}
+          - -e
+          - AWS_SECRET_ACCESS_KEY={{ rustfs_secret_key }}
+          - -e
+          - AWS_DEFAULT_REGION=us-east-1
+          - "{{ rustfs_cli_image }}:{{ rustfs_cli_image_tag }}"
+          - --endpoint-url
+          - "http://127.0.0.1:{{ rustfs_api_port }}"
+          - s3api
+          - create-bucket
+          - --bucket
+          - "{{ rustfs_bucket }}"
+      register: rustfs_bucket_create
+      no_log: true
+      failed_when:
+        - rustfs_bucket_create.rc != 0
+        - rustfs_bucket_create.stderr is not search('BucketAlreadyOwnedByYou')
+        - rustfs_bucket_create.stderr is not search('BucketAlreadyExists')
+      changed_when: rustfs_bucket_create.rc == 0
+      tags: [rustfs]
 
     #--------------------------------------------------------------------------
     # Gitea - Internal Git Server for GitOps
@@ -460,17 +1127,29 @@
       tags: [gitea]
 
     - name: Create Gitea admin user
-      ansible.builtin.shell:
-        cmd: |
-          docker exec -u git gitea gitea admin user create \
-            --username '{{ gitea_admin_user }}' \
-            --password '{{ gitea_admin_password }}' \
-            --email '{{ gitea_admin_email }}' \
-            --admin \
-            --must-change-password=false
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -u
+          - git
+          - gitea
+          - gitea
+          - admin
+          - user
+          - create
+          - --username
+          - "{{ gitea_admin_user }}"
+          - --password
+          - "{{ gitea_admin_password }}"
+          - --email
+          - "{{ gitea_admin_email }}"
+          - --admin
+          - --must-change-password=false
       when:
         - gitea_admin_password is defined
         - gitea_admin_user not in gitea_admin_check.stdout
+      no_log: true
       tags: [gitea]
 
     - name: Check if Gitea organization exists
@@ -483,6 +1162,7 @@
         force_basic_auth: true
       register: gitea_org_check
       when: gitea_admin_password is defined
+      no_log: true
       tags: [gitea]
 
     - name: Create Gitea organization
@@ -500,6 +1180,7 @@
       when:
         - gitea_admin_password is defined
         - gitea_org_check.status == 404
+      no_log: true
       tags: [gitea]
 
     - name: Check if Gitea repository exists
@@ -512,6 +1193,7 @@
         force_basic_auth: true
       register: gitea_repo_check
       when: gitea_admin_password is defined
+      no_log: true
       tags: [gitea]
 
     - name: Create Gitea repository
@@ -531,6 +1213,7 @@
       when:
         - gitea_admin_password is defined
         - gitea_repo_check.status == 404
+      no_log: true
       tags: [gitea]
 
     #--------------------------------------------------------------------------
@@ -547,6 +1230,16 @@
       loop: "{{ range(1, runner_count + 1) | list }}"
       tags: [runner]
 
+    - name: Create persistent runner configuration directories
+      ansible.builtin.file:
+        path: "{{ runner_config_dir }}/runner-{{ item }}"
+        state: directory
+        owner: 1000
+        group: 1000
+        mode: "0700"
+      loop: "{{ range(1, runner_count + 1) | list }}"
+      tags: [runner]
+
     - name: Create shared externals directory
       ansible.builtin.file:
         path: "{{ data_mount_point }}/externals"
@@ -558,8 +1251,7 @@
 
     - name: Pull GitHub Actions runner image
       community.docker.docker_image:
-        name: myoung34/github-runner
-        tag: "{{ runner_image_tag }}"
+        name: "{{ runner_image_ref }}"
         source: pull
         force_source: false
       tags: [runner]
@@ -574,7 +1266,7 @@
       ansible.builtin.shell: |
         docker run --rm --entrypoint /bin/cp \
           -v {{ data_mount_point }}/externals:/target \
-          myoung34/github-runner:{{ runner_image_tag }} \
+          {{ runner_image_ref }} \
           -r /actions-runner/externals/. /target/
       when: not externals_check.stat.exists
       tags: [runner]
@@ -593,27 +1285,405 @@
         state: link
       tags: [runner]
 
-    - name: Deploy runner containers
+    - name: Stop and remove existing runner containers before re-registration
       community.docker.docker_container:
-        name: "runner-{{ item }}"
-        image: "myoung34/github-runner:{{ runner_image_tag }}"
-        state: started
-        restart_policy: always
-        env:
-          RUNNER_NAME: "saif-runner-{{ item }}"
-          RUNNER_SCOPE: "org"
-          ORG_NAME: "{{ github_org }}"
-          LABELS: "{{ github_runner_labels }}"
-          RUNNER_TOKEN: "{{ runner_token }}"
-          RUNNER_WORKDIR: "{{ data_mount_point }}/runner-{{ item }}"
-          # Disable auto-updates: runner self-updates fail in Docker containers
-          # causing restart loops. Updates are controlled via image tag instead.
-          DISABLE_AUTO_UPDATE: "true"
-        volumes:
-          - "/var/run/docker.sock:/var/run/docker.sock"
-          - "{{ data_mount_point }}/runner-{{ item }}:{{ data_mount_point }}/runner-{{ item }}"
+        docker_host: "unix://{{ runner_docker_socket_path }}"
+        name: "{{ runner_container_name_prefix }}{{ item }}"
+        state: absent
+        force_kill: true
       loop: "{{ range(1, runner_count + 1) | list }}"
       tags: [runner]
+
+    - name: Remove stale runner registration files before redeploy
+      ansible.builtin.file:
+        path: "{{ runner_config_dir }}/runner-{{ item.0 }}/{{ item.1 }}"
+        state: absent
+      loop: "{{ range(1, runner_count + 1) | list | product(['.runner.bak']) | list }}"
+      tags: [runner]
+
+    - name: Deploy runner containers
+      community.docker.docker_container:
+        docker_host: "unix://{{ runner_docker_socket_path }}"
+        name: "{{ runner_container_name_prefix }}{{ item }}"
+        image: "{{ runner_image_ref }}"
+        state: started
+        restart_policy: always
+        labels:
+          managed-by: "{{ runner_managed_by }}"
+          runner-org: "{{ github_org }}"
+        env:
+          RUNNER_NAME: '{{ runner_name_prefix }}{{ item }}'
+          RUNNER_SCOPE: '{{ runner_scope }}'
+          ORG_NAME: '{{ github_org }}'
+          REPO_URL: '{{ github_runner_url }}'
+          LABELS: '{{ github_runner_labels }}'
+          RUNNER_TOKEN: '{{ runner_token }}'
+          RUNNER_WORKDIR: '{{ data_mount_point }}/runner-{{ item }}'
+          CONFIGURED_ACTIONS_RUNNER_FILES_DIR: /runner-config
+          DISABLE_AUTOMATIC_DEREGISTRATION: 'true'
+          DISABLE_AUTO_UPDATE: 'true'
+        volumes:
+          - "{{ runner_docker_socket_path }}:/var/run/docker.sock"
+          - "{{ data_mount_point }}/runner-{{ item }}:{{ data_mount_point }}/runner-{{ item }}"
+          - "{{ runner_config_dir }}/runner-{{ item }}:/runner-config"
+      loop: "{{ range(1, runner_count + 1) | list }}"
+      no_log: true
+      tags: [runner]
+
+    #--------------------------------------------------------------------------
+    # Runner VM Standby Backup Sync
+    #--------------------------------------------------------------------------
+
+    - name: Install runner VM standby backup sync script
+      ansible.builtin.copy:
+        dest: "{{ runner_vm_backup_script }}"
+        mode: "0750"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          ts=$(date -u +%Y%m%dT%H%M%SZ)
+          backup_dir=/data/backups
+          archive="${backup_dir}/runner-vm-critical-${ts}.tgz"
+          standby="{{ runner_vm_standby_user }}@{{ runner_vm_standby_host }}"
+          standby_dir=/data/standby-backups
+
+          log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+
+          mkdir -p "$backup_dir"
+          tar --xattrs --acls -czf "$archive" \
+            /data/tfstate \
+            /data/.tfstate_kms_key \
+            /data/certs \
+            /data/.htpasswd \
+            /data/runner-config \
+            /etc/fstab \
+            /etc/docker/daemon.json \
+            /etc/containerd/config.toml \
+            /etc/systemd/timesyncd.conf.d/example.conf
+          chmod 600 "$archive"
+          log "created $archive"
+          find "$backup_dir" -name 'runner-vm-critical-*.tgz' -mtime +{{ runner_vm_backup_retention_days }} -delete
+
+          chown {{ runner_vm_standby_user }}:{{ runner_vm_standby_user }} "$archive"
+          ssh_opts=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
+          sudo -Hu {{ runner_vm_standby_user }} ssh "${ssh_opts[@]}" "$standby" "sudo mkdir -p '$standby_dir' && sudo chown {{ runner_vm_standby_user }}:{{ runner_vm_standby_user }} '$standby_dir'"
+          sudo -Hu {{ runner_vm_standby_user }} scp -q "${ssh_opts[@]}" "$archive" "$standby:${standby_dir}/"
+          sudo -Hu {{ runner_vm_standby_user }} ssh "${ssh_opts[@]}" "$standby" "chmod 600 '${standby_dir}/$(basename "$archive")' && find '$standby_dir' -name 'runner-vm-critical-*.tgz' -mtime +{{ runner_vm_backup_retention_days }} -delete"
+          chown root:root "$archive"
+          find "$backup_dir" -name 'runner-vm-critical-*.tgz' -mtime +{{ runner_vm_backup_retention_days }} -delete
+          log "synced $(basename "$archive") to $standby:$standby_dir"
+      tags: [backup]
+
+    - name: Install runner VM standby backup sync cron
+      ansible.builtin.copy:
+        dest: /etc/cron.d/saif-runner-vm-backup-sync
+        mode: "0644"
+        content: |
+          17 2 * * * root {{ runner_vm_backup_script }} >> {{ runner_vm_backup_log }} 2>&1
+      tags: [backup]
+
+    #--------------------------------------------------------------------------
+    # Runner VM Health Checks
+    #--------------------------------------------------------------------------
+
+    - name: Install runner VM health check script
+      ansible.builtin.copy:
+        dest: "{{ runner_vm_health_script }}"
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -u
+
+          status=0
+          ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          log() { printf '%s %s\n' "$ts" "$*"; }
+          fail() { log "FAIL $*"; status=1; }
+          warn() { log "WARN $*"; }
+          ok() { log "OK $*"; }
+
+          data_used=$(df -P {{ data_mount_point }} | awk 'NR==2 {gsub("%", "", $5); print $5}')
+          if [ "$data_used" -ge {{ runner_vm_data_crit_percent }} ]; then
+            fail "{{ data_mount_point }} usage ${data_used}% >= critical {{ runner_vm_data_crit_percent }}%"
+          elif [ "$data_used" -ge {{ runner_vm_data_warn_percent }} ]; then
+            warn "{{ data_mount_point }} usage ${data_used}% >= warning {{ runner_vm_data_warn_percent }}%"
+          else
+            ok "{{ data_mount_point }} usage ${data_used}%"
+          fi
+
+          for svc in docker containerd systemd-networkd systemd-resolved ssh ufw; do
+            systemctl is-active --quiet "$svc" && ok "service $svc active" || fail "service $svc inactive"
+          done
+
+          timedatectl show -p NTPSynchronized --value | grep -qx yes && ok "time synchronized" || fail "time not synchronized"
+
+          security_updates=$(apt-get -s upgrade 2>/dev/null | grep -ci '^Inst .*security' || true)
+          if [ "$security_updates" -gt 0 ]; then
+            warn "security package updates pending $security_updates"
+          else
+            ok "no pending security package updates detected"
+          fi
+
+          docker info >/dev/null 2>&1 && ok "docker info reachable" || fail "docker info unreachable"
+
+          check_endpoint() {
+            name=$1
+            url=$2
+            expected=$3
+            shift 3
+            code=$(curl "$@" -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" || true)
+            [ "$code" = "$expected" ] && ok "endpoint $name http $code" || fail "endpoint $name http $code expected $expected"
+          }
+
+          check_endpoint registry "https://localhost:{{ registry_port }}/v2/" 200 -k
+          check_endpoint webserver "http://localhost:{{ webserver_port }}/healthz" 200
+          check_endpoint tfstate "http://localhost:{{ tfstate_port }}/health" 200
+          check_endpoint rustfs-api "http://localhost:{{ rustfs_api_port }}/health" 200
+          check_endpoint rustfs-console "http://localhost:{{ rustfs_console_port }}/rustfs/console/health" 200
+
+          rustfs_status=$(docker inspect -f '{{ "{{.State.Status}}" }} {{ "{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}" }}' {{ rustfs_container_name }} 2>/dev/null || true)
+          case "$rustfs_status" in
+            "running healthy"|"running no-healthcheck") ok "rustfs container $rustfs_status" ;;
+            "") fail "rustfs container missing" ;;
+            *) fail "rustfs container unhealthy: $rustfs_status" ;;
+          esac
+
+          rustfs_size=$(du -sh {{ rustfs_data_dir }} 2>/dev/null | awk '{print $1}' || true)
+          [ -n "$rustfs_size" ] && ok "rustfs data size $rustfs_size" || warn "rustfs data size unavailable"
+          rustfs_bucket_bytes=$(du -sb {{ rustfs_data_dir }}/{{ rustfs_bucket }} 2>/dev/null | awk '{print $1}' || echo 0)
+          rustfs_bucket_gib=$(( rustfs_bucket_bytes / 1024 / 1024 / 1024 ))
+          if [ "$rustfs_bucket_gib" -gt {{ rustfs_max_bucket_gib }} ]; then
+            fail "rustfs bucket ${rustfs_bucket_gib}Gi exceeds cap {{ rustfs_max_bucket_gib }}Gi"
+          else
+            ok "rustfs bucket ${rustfs_bucket_gib}Gi <= cap {{ rustfs_max_bucket_gib }}Gi"
+          fi
+          systemctl is-active --quiet example-rustfs-timescape-cleanup.timer && ok "rustfs cleanup timer active" || fail "rustfs cleanup timer inactive"
+          rustfs_stale_grace_mins=$(( {{ rustfs_retention_hours }} * 60 + {{ rustfs_cleanup_interval_minutes }} ))
+          stale_timescape=$(find {{ rustfs_timescape_prefix_dir }} -type f -mmin +$rustfs_stale_grace_mins -print -quit 2>/dev/null || true)
+          [ -z "$stale_timescape" ] && ok "rustfs Timescape prefix within {{ rustfs_retention_hours }}h retention plus cleanup interval" || warn "rustfs Timescape stale object exists beyond cleanup grace: $stale_timescape"
+
+          if getent hosts {{ rustfs_dns_name }} >/dev/null 2>&1; then
+            rustfs_dns_ip=$(getent hosts {{ rustfs_dns_name }} | awk '{print $1; exit}')
+            [ "$rustfs_dns_ip" = "{{ ansible_host }}" ] && ok "rustfs DNS {{ rustfs_dns_name }} -> $rustfs_dns_ip" || fail "rustfs DNS {{ rustfs_dns_name }} -> $rustfs_dns_ip expected {{ ansible_host }}"
+          else
+            fail "rustfs DNS {{ rustfs_dns_name }} unresolved"
+          fi
+
+          if [ {{ runner_vm_expected_runners }} -gt 0 ]; then
+            bad_runners=$(docker ps -a --filter 'name=runner-' --format '{{ "{{.Names}} {{.Status}}" }}' | grep -E 'Restarting|Exited|Dead' || true)
+            if [ -n "$bad_runners" ]; then
+              fail "runner containers unhealthy: $(echo "$bad_runners" | tr '\n' ';')"
+            else
+              ok "runner containers not in failed states"
+            fi
+
+            running_runners=$(docker ps --filter 'name=runner-' --filter 'status=running' --format '{{ "{{.Names}}" }}' | wc -l | tr -d ' ')
+            if [ "$running_runners" -ge {{ runner_vm_expected_runners }} ]; then
+              ok "runner containers healthy $running_runners/{{ runner_vm_expected_runners }}"
+            else
+              fail "runner containers healthy $running_runners/{{ runner_vm_expected_runners }}"
+            fi
+          else
+            ok "runner container checks disabled for isolated restore test"
+          fi
+
+          {% if runner_vm_health_alert_command | default('') | length > 0 %}
+          {{ runner_vm_health_alert_command }}
+          {% endif %}
+
+          exit "$status"
+      tags: [health]
+
+    - name: Install runner VM health alert helper
+      ansible.builtin.copy:
+        dest: "{{ runner_vm_health_alert_script }}"
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -u
+
+          env_file="{{ runner_vm_health_alert_env }}"
+          [ -f "$env_file" ] || exit 0
+          # shellcheck disable=SC1090
+          . "$env_file"
+
+          [ -n "${WEBEX_BOT_TOKEN:-}" ] || exit 0
+          if [ -z "${WEBEX_ROOM_ID:-}" ] && [ -z "${WEBEX_TO_PERSON_EMAIL:-}" ]; then
+            exit 0
+          fi
+
+          payload=$(WEBEX_ROOM_ID="${WEBEX_ROOM_ID:-}" WEBEX_TO_PERSON_EMAIL="${WEBEX_TO_PERSON_EMAIL:-}" python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+
+          log_path = Path("{{ runner_vm_health_log }}")
+          state_path = Path("/var/lib/saif-runner-vm-health-alert.state")
+          min_repeat_seconds = 86400
+
+          def run(command):
+              return subprocess.run(command, shell=True, text=True, capture_output=True, timeout=15).stdout.strip()
+
+          try:
+              lines = log_path.read_text(errors="replace").splitlines()[-120:]
+          except FileNotFoundError:
+              lines = ["health log not found"]
+
+          parsed = []
+          for line in lines:
+              match = re.match(r"^(\S+)\s+(FAIL|WARN|OK)\s+(.+)$", line)
+              if match:
+                  parsed.append((match.group(1), match.group(2), match.group(3)))
+
+          latest_ts = parsed[-1][0] if parsed else "unknown"
+          latest = {}
+          for ts, level, msg in parsed:
+              if ts == latest_ts:
+                  latest[msg] = (ts, level, msg)
+
+          failures = [v for v in latest.values() if v[1] == "FAIL"]
+          warnings = [v for v in latest.values() if v[1] == "WARN"]
+          oks = [v for v in latest.values() if v[1] == "OK"]
+          signature = "\n".join(sorted(f"{level} {msg}" for _, level, msg in failures + warnings))
+
+          now = time.time()
+          previous_signature = ""
+          previous_sent_at = 0.0
+          try:
+              state = json.loads(state_path.read_text())
+              previous_signature = state.get("signature", "")
+              previous_sent_at = float(state.get("sent_at", 0))
+          except (FileNotFoundError, ValueError, json.JSONDecodeError):
+              pass
+
+          signature_changed = signature != previous_signature
+          repeat_due = now - previous_sent_at >= min_repeat_seconds
+          if not signature_changed and not repeat_due:
+              raise SystemExit(0)
+
+          state_path.parent.mkdir(parents=True, exist_ok=True)
+          state_path.write_text(json.dumps({"signature": signature, "sent_at": now}))
+
+          icon = "🔴" if failures else ("🟠" if warnings else "🟢")
+          title = "RED alert" if failures else ("AMBER warning" if warnings else "GREEN healthy")
+          uptime = run("uptime -p") or "unknown"
+          boot_time = run("uptime -s") or "unknown"
+          disk = run("df -h --output=used,size,pcent {{ data_mount_point }} | tail -1")
+          disk_parts = disk.split()
+          data_line = f"{disk_parts[0]} used / {disk_parts[1]} total ({disk_parts[2]})" if len(disk_parts) == 3 else "unknown"
+          ntp_line = run("timedatectl show -p NTPSynchronized --value | sed 's/yes/synchronized/;s/no/not synchronized/'") or "unknown"
+          ntp_server = run("timedatectl timesync-status 2>/dev/null | awk -F': ' '/Server:/ {print $2; exit}'") or "unknown"
+          runner_running = run("docker ps --filter 'name=runner-' --filter 'status=running' --format '{{ '{{.Names}}' }}' | wc -l | tr -d ' '") or "0"
+          runner_total = run("docker ps -a --filter 'name=runner-' --format '{{ '{{.Names}}' }}' | wc -l | tr -d ' '") or "0"
+          critical_container_runtime = run("docker ps -a --filter 'name=registry' --filter 'name=webserver-1' --filter 'name=terraform-backend' --filter 'name={{ rustfs_container_name }}' --format '{{ '{{.Names}}: {{.Status}}' }}' | sort | paste -sd ';' - | sed 's/;/; /g;s/Up/running/g'") or "unknown"
+          recent_restarts = run("docker ps -a --format '{{ '{{.Names}} {{.Status}}' }}' | grep -E 'registry|webserver-1|terraform-backend|{{ rustfs_container_name }}|runner-' | grep -E 'Restarting|Exited|Dead|Restarted|Up Less than|Up [0-9]+ seconds|Up About a minute|Up [0-9]+ minutes' || true")
+          registry_size = run("du -sh /data/registry 2>/dev/null | awk '{print $1}'") or "unknown"
+          containerd_size = run("du -sh /data/containerd 2>/dev/null | awk '{print $1}'") or "unknown"
+          images_size = run("du -sh /data/images 2>/dev/null | awk '{print $1}'") or "unknown"
+          rustfs_size = run("du -sh {{ rustfs_data_dir }} 2>/dev/null | awk '{print $1}'") or "unknown"
+          rustfs_bucket_size = run("du -sh {{ rustfs_data_dir }}/{{ rustfs_bucket }} 2>/dev/null | awk '{print $1}'") or "unknown"
+          rustfs_cleanup_state = run("systemctl is-active example-rustfs-timescape-cleanup.timer 2>/dev/null") or "unknown"
+          rustfs_oldest = run("find {{ rustfs_timescape_prefix_dir }} -type f -printf '%TY-%Tm-%TdT%TH:%TM:%TS %p\\n' 2>/dev/null | sort | head -1") or "none"
+          cert_expiry = run("openssl x509 -in /data/certs/registry.crt -noout -enddate 2>/dev/null | cut -d= -f2-") or "unknown"
+          reboot_required = "yes" if Path("/var/run/reboot-required").exists() else "no"
+          backup_latest = run("ls -1t /data/backups/runner-vm-critical-*.tgz 2>/dev/null | head -1 | xargs -r stat -c '%y %n'") or "none found"
+          standby_backup_latest = subprocess.run(
+              [
+                  "sudo", "-Hu", "{{ runner_vm_standby_user }}",
+                  "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=accept-new",
+                  "{{ runner_vm_standby_user }}@{{ runner_vm_standby_host }}",
+                  "ls -1t /data/standby-backups/runner-vm-critical-*.tgz 2>/dev/null | head -1 | xargs -r stat -c '%y %n'",
+              ],
+              text=True,
+              capture_output=True,
+              timeout=15,
+          ).stdout.strip() or "none found"
+          mem = run("free -h | awk '/^Mem:/ {print $3, $2}'")
+          mem_parts = mem.split()
+          mem_line = f"{mem_parts[0]} used / {mem_parts[1]} total" if len(mem_parts) == 2 else "unknown"
+
+          def bullets(items, limit=4):
+              values = [msg for _, _, msg in items][:limit]
+              if len(items) > limit:
+                  values.append(f"+{len(items) - limit} more")
+              return "\n".join(f"- {msg}" for msg in values) or "- none"
+
+          endpoint_codes = {}
+          for name in ("registry", "webserver", "tfstate", "rustfs-api", "rustfs-console"):
+              prefix = f"endpoint {name} http "
+              result = next((msg for _, _, msg in latest.values() if msg.startswith(prefix)), None)
+              endpoint_codes[name] = result.split()[3] if result else "unknown"
+          endpoint_line = ", ".join(f"{name} {code}" for name, code in endpoint_codes.items())
+
+          problem_items = failures + warnings
+          if backup_latest == "none found":
+              problem_items.append((latest_ts, "WARN", "no local critical backup archive found"))
+          if standby_backup_latest == "none found":
+              problem_items.append((latest_ts, "WARN", "no standby critical backup mirror found"))
+
+          markdown = (
+              f"{icon} **SITE Lab runner VM health: {title}**\n"
+              f"_{latest_ts} UTC · alert on change, then daily_\n\n"
+              f"**At a glance**\n"
+              f"- Runners: **{runner_running}/{runner_total}** containers running\n"
+              f"- Tier-0 endpoints: {endpoint_line}\n"
+              f"- Tier-0 container runtime: {critical_container_runtime}\n"
+              f"- RustFS data: {rustfs_size}; bucket {rustfs_bucket_size}; cleanup {rustfs_cleanup_state}; oldest Timescape object {rustfs_oldest}\n"
+              f"- Data disk: **{data_line}**\n"
+              f"- NTP: {ntp_line} ({ntp_server})\n"
+              f"- Uptime: {uptime}\n\n"
+              f"**Capacity & maintenance**\n"
+              f"- Registry / containerd / images: {registry_size} / {containerd_size} / {images_size}\n"
+              f"- Security updates: {next((msg.split()[-1] for _, level, msg in warnings if msg.startswith('security package updates pending')), '0')} pending · reboot required: {reboot_required}\n"
+              f"- Memory: {mem_line}\n"
+              f"- Latest local backup: {backup_latest}\n"
+              f"- Latest standby mirror: {standby_backup_latest}\n\n"
+              f"**Problems to act on**\n"
+              f"{bullets(problem_items)}\n\n"
+              f"**Recent restarts / boot loops**\n```\n{recent_restarts or 'none'}\n```\n"
+          )
+          payload = {"markdown": markdown}
+          room_id = os.environ.get("WEBEX_ROOM_ID", "")
+          to_person_email = os.environ.get("WEBEX_TO_PERSON_EMAIL", "")
+          if room_id:
+              payload["roomId"] = room_id
+          else:
+              payload["toPersonEmail"] = to_person_email
+          print(json.dumps(payload))
+          PY
+          )
+
+          [ -n "$payload" ] || exit 0
+
+          curl -fsS --max-time 10 \
+            -X POST "https://webexapis.com/v1/messages" \
+            -H "Authorization: Bearer ${WEBEX_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$payload" >/dev/null || true
+      tags: [health]
+
+    - name: Install runner VM health alert env placeholder
+      ansible.builtin.copy:
+        dest: "{{ runner_vm_health_alert_env }}"
+        mode: "0600"
+        force: false
+        content: |
+          # Managed placeholder. Add values manually or via secret management.
+          # WEBEX_BOT_TOKEN=
+          # WEBEX_ROOM_ID=
+          # WEBEX_TO_PERSON_EMAIL=operator@example.invalid
+      tags: [health]
+
+    - name: Install runner VM health check cron
+      ansible.builtin.copy:
+        dest: /etc/cron.d/saif-runner-vm-health
+        mode: "0644"
+        content: |
+          */5 * * * * root {{ runner_vm_health_script }} >> {{ runner_vm_health_log }} 2>&1
+      tags: [health]
 
     #--------------------------------------------------------------------------
     # Final Status
@@ -640,8 +1710,8 @@
 
           GitHub Actions Runners:
           - {{ runner_count }} DinD runners deployed (runner-1 to runner-{{ runner_count }})
-          - Image: myoung34/github-runner:{{ runner_image_tag }}
+          - Image: {{ runner_image_ref }}
           - Labels: {{ github_runner_labels }}
 
-          Note: CI/CD tools (Terraform, oc, kubectl, etc.) are provided via
-          the github-actions-container image used in workflow container: directive.
+          Note: Most CI/CD tools are provided via the github-actions-container image.
+          The tools tag installs runner-local demo/validation CLIs for SITE Lab path tests.

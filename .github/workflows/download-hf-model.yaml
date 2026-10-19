@@ -1,0 +1,304 @@
+name: 'Download Hugging Face Model'
+
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo:
+        description: 'Hugging Face repo ID, for example google/gemma-4-E4B-it'
+        required: true
+        type: string
+      model_name:
+        description: 'Local model artifact name, for example gemma-4-e4b-it'
+        required: true
+        type: string
+      tag:
+        description: 'Local model artifact tag'
+        required: false
+        default: 'r1'
+        type: string
+      downloader_image:
+        description: 'Local registry vLLM downloader image'
+        required: true
+        type: string
+      force_download:
+        description: 'Force re-download and rebuild even if artifacts exist'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CACHE_ROOT: ${{ vars.HF_MODEL_CACHE_ROOT }}
+  HTTP_SERVER: ${{ vars.MODEL_HTTP_SERVER_URL }}
+  LOCAL_REGISTRY: ${{ vars.OCP_REGISTRY_URL }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  download-hf-model:
+    name: 'Download and Publish HF Model'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    timeout-minutes: 360
+    env:
+      HTTP_USER: ${{ secrets.HTTP_SERVER_USER }}
+      HTTP_PASS: ${{ secrets.HTTP_SERVER_PASSWORD }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+    steps:
+      - name: Setup
+        id: setup
+        run: |
+          set -euo pipefail
+          : "${CACHE_ROOT:?declare the optional model cache root}" "${HTTP_SERVER:?declare the optional model HTTP endpoint}"
+          : "${HTTP_USER:?missing runtime model service username}" "${HTTP_PASS:?missing runtime model service password}"
+          case "$CACHE_ROOT" in /*) ;; *) echo 'Cache root must be absolute' >&2; exit 1 ;; esac
+          case "$HTTP_SERVER" in https://*) ;; *) echo 'Model service endpoint requires trusted HTTPS' >&2; exit 1 ;; esac
+
+          set -euo pipefail
+
+          HF_REPO="${{ inputs.hf_repo }}"
+          MODEL_NAME="${{ inputs.model_name }}"
+          TAG="${{ inputs.tag }}"
+          REPO_SLUG="${HF_REPO//\//__}"
+          CACHE_PATH="${CACHE_ROOT}/${REPO_SLUG}"
+          CACHE_URL="${HTTP_SERVER}/hf-models/${REPO_SLUG}"
+          MODEL_IMAGE="${LOCAL_REGISTRY}/models/${MODEL_NAME}:${TAG}"
+
+          mkdir -p "$CACHE_PATH"
+
+          echo "hf_repo=$HF_REPO" >> "$GITHUB_OUTPUT"
+          echo "repo_slug=$REPO_SLUG" >> "$GITHUB_OUTPUT"
+          echo "cache_path=$CACHE_PATH" >> "$GITHUB_OUTPUT"
+          echo "cache_url=$CACHE_URL" >> "$GITHUB_OUTPUT"
+          echo "model_image=$MODEL_IMAGE" >> "$GITHUB_OUTPUT"
+
+          echo "## Hugging Face Model" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **HF repo:** $HF_REPO" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Cache path:** $CACHE_PATH" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **HTTP URL:** $CACHE_URL/" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Model image:** $MODEL_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate Secrets
+        run: |
+          set -euo pipefail
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "::error::HF_TOKEN secret is required"
+            exit 1
+          fi
+          if [ -z "${HTTP_USER:-}" ] || [ -z "${HTTP_PASS:-}" ]; then
+            echo "::error::HTTP user and HTTP_SERVER_PASSWORD secret are required"
+            exit 1
+          fi
+
+      - name: Check Existing Artifacts
+        id: check
+        run: |
+          set -euo pipefail
+          CACHE_URL="${{ steps.setup.outputs.cache_url }}"
+          MODEL_IMAGE="${{ steps.setup.outputs.model_image }}"
+          FORCE_DOWNLOAD="${{ inputs.force_download }}"
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u "${HTTP_USER}:${HTTP_PASS}" \
+            "${CACHE_URL}/.cache-ready")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            CACHE_READY=true
+          else
+            CACHE_READY=false
+          fi
+
+          if skopeo inspect --tls-verify=true "docker://${MODEL_IMAGE}" > /dev/null 2>&1; then
+            IMAGE_READY=true
+          else
+            IMAGE_READY=false
+          fi
+
+          if [ "$CACHE_READY" = "true" ] && [ "$IMAGE_READY" = "true" ] && [ "$FORCE_DOWNLOAD" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "## Result: Skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "Cache marker and local registry artifact already exist." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "cache_ready=$CACHE_READY" >> "$GITHUB_OUTPUT"
+          echo "image_ready=$IMAGE_READY" >> "$GITHUB_OUTPUT"
+
+      - name: Repair Readiness Marker
+        if: steps.check.outputs.skip != 'true' && steps.check.outputs.image_ready == 'true' && inputs.force_download != true
+        id: repair_marker
+        run: |
+          set -euo pipefail
+          CACHE_PATH="${{ steps.setup.outputs.cache_path }}"
+          CACHE_URL="${{ steps.setup.outputs.cache_url }}"
+          MODEL_IMAGE="${{ steps.setup.outputs.model_image }}"
+
+          if [ ! -d "$CACHE_PATH" ] || [ -z "$(find "$CACHE_PATH" -mindepth 1 -not -name .cache-ready -print -quit)" ]; then
+            echo "repaired=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DIGEST=$(skopeo inspect --tls-verify=true "docker://${MODEL_IMAGE}" | jq -r '.Digest')
+          printf 'hf_repo=%s\nmodel_image=%s\ndigest=%s\ntimestamp=%s\n' \
+            '${{ steps.setup.outputs.hf_repo }}' \
+            "$MODEL_IMAGE" \
+            "$DIGEST" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "${CACHE_PATH}/.cache-ready"
+
+          HTTP_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -u "${HTTP_USER}:${HTTP_PASS}" \
+            -T "${CACHE_PATH}/.cache-ready" \
+            "${CACHE_URL}/.cache-ready" || true)
+
+          if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ] && [ "$HTTP_STATUS" != "204" ]; then
+            echo "::warning::WebDAV marker upload returned HTTP $HTTP_STATUS; local marker exists at ${CACHE_PATH}/.cache-ready"
+          fi
+
+          echo "repaired=true" >> "$GITHUB_OUTPUT"
+
+      - name: Pull Downloader Image
+        if: steps.check.outputs.skip != 'true' && steps.repair_marker.outputs.repaired != 'true'
+        run: |
+          set -euo pipefail
+          docker pull "${{ inputs.downloader_image }}"
+
+      - name: Download Model Weights
+        if: steps.check.outputs.skip != 'true' && steps.repair_marker.outputs.repaired != 'true'
+        run: |
+          set -euo pipefail
+          CACHE_PATH="${{ steps.setup.outputs.cache_path }}"
+          HF_REPO="${{ steps.setup.outputs.hf_repo }}"
+
+          rm -f "${CACHE_PATH}/.cache-ready"
+
+          docker run --rm \
+            -e HF_TOKEN \
+            -e HF_XET_HIGH_PERFORMANCE=1 \
+            -v "${CACHE_PATH}:/models" \
+            "${{ inputs.downloader_image }}" \
+            hf download "$HF_REPO" \
+              --local-dir /models
+
+      - name: Validate Downloaded Model
+        if: steps.check.outputs.skip != 'true' && steps.repair_marker.outputs.repaired != 'true'
+        run: |
+          set -euo pipefail
+          CACHE_PATH="${{ steps.setup.outputs.cache_path }}"
+
+          docker run --rm \
+            -v "${CACHE_PATH}:/models:ro" \
+            "${{ inputs.downloader_image }}" \
+            python3 -c "from pathlib import Path; from transformers import AutoConfig; p=Path('/models'); assert p.exists() and any(p.iterdir()), 'model directory is empty'; AutoConfig.from_pretrained('/models'); print('model config loaded')"
+
+      - name: Build Model Artifact
+        if: steps.check.outputs.skip != 'true' && steps.repair_marker.outputs.repaired != 'true'
+        run: |
+          set -euo pipefail
+          CACHE_PATH="${{ steps.setup.outputs.cache_path }}"
+          MODEL_IMAGE="${{ steps.setup.outputs.model_image }}"
+          BUILD_DIR=$(mktemp -d)
+          trap 'rm -rf "$BUILD_DIR"' EXIT
+
+          mkdir -p "${BUILD_DIR}/models"
+          # Materialize Hugging Face files through the Docker daemon. The runner
+          # and Docker daemon may not share the same view of /data, so direct
+          # rsync from CACHE_PATH can see an empty directory even though docker
+          # containers mounted at CACHE_PATH see the downloaded files.
+          CACHE_COPY_CONTAINER=$(docker create -v "${CACHE_PATH}:/models:ro" busybox:1.36 true)
+          trap 'docker rm -f "$CACHE_COPY_CONTAINER" >/dev/null 2>&1 || true; rm -rf "$BUILD_DIR"' EXIT
+          docker cp "${CACHE_COPY_CONTAINER}:/models/." "${BUILD_DIR}/models/"
+          docker rm "$CACHE_COPY_CONTAINER"
+
+          if [ ! -s "${BUILD_DIR}/models/config.json" ]; then
+            echo "::error::config.json missing after docker-copying cache into build context"
+            echo "Docker-visible /models tree:"
+            docker run --rm -v "${CACHE_PATH}:/models:ro" busybox:1.36 sh -c 'find /models -maxdepth 3 -printf "%y %p -> %l %s\n" | sort | head -200'
+            echo "BUILD_DIR tree:"
+            find "${BUILD_DIR}/models" -maxdepth 3 -printf '%y %p -> %l %s\n' | sort | head -200
+            exit 1
+          fi
+          find "${BUILD_DIR}/models" -maxdepth 1 -type f -printf '%f %s\n' | sort
+          printf 'FROM busybox:1.36\nCOPY models/ /models/\nCMD ["sh", "-c", "cp -a /models/. /shared/"]\n' > "${BUILD_DIR}/Containerfile"
+
+          docker build -f "${BUILD_DIR}/Containerfile" -t "$MODEL_IMAGE" "$BUILD_DIR"
+          docker run --rm "$MODEL_IMAGE" sh -c 'test -s /models/config.json && find /models -maxdepth 1 -type f -printf "%f %s\n" | sort | head -50'
+
+      - name: Push Model Artifact
+        id: push
+        if: steps.check.outputs.skip != 'true' && steps.repair_marker.outputs.repaired != 'true'
+        run: |
+          set -euo pipefail
+          MODEL_IMAGE="${{ steps.setup.outputs.model_image }}"
+
+          docker push "$MODEL_IMAGE"
+          DIGEST=$(skopeo inspect --tls-verify=true "docker://${MODEL_IMAGE}" | jq -r '.Digest')
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Create Readiness Marker
+        if: steps.check.outputs.skip != 'true' && steps.repair_marker.outputs.repaired != 'true'
+        run: |
+          set -euo pipefail
+          CACHE_PATH="${{ steps.setup.outputs.cache_path }}"
+          CACHE_URL="${{ steps.setup.outputs.cache_url }}"
+          MODEL_IMAGE="${{ steps.setup.outputs.model_image }}"
+          DIGEST="${{ steps.push.outputs.digest }}"
+
+          printf 'hf_repo=%s\nmodel_image=%s\ndigest=%s\ntimestamp=%s\n' \
+            '${{ steps.setup.outputs.hf_repo }}' \
+            "$MODEL_IMAGE" \
+            "$DIGEST" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "${CACHE_PATH}/.cache-ready"
+
+          HTTP_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -u "${HTTP_USER}:${HTTP_PASS}" \
+            -T "${CACHE_PATH}/.cache-ready" \
+            "${CACHE_URL}/.cache-ready" || true)
+
+          if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ] && [ "$HTTP_STATUS" != "204" ]; then
+            echo "::warning::WebDAV marker upload returned HTTP $HTTP_STATUS; local marker exists at ${CACHE_PATH}/.cache-ready"
+          fi
+
+      - name: Verify Artifacts
+        if: steps.check.outputs.skip != 'true' || steps.check.outputs.skip == 'true'
+        run: |
+          set -euo pipefail
+          CACHE_PATH="${{ steps.setup.outputs.cache_path }}"
+          CACHE_URL="${{ steps.setup.outputs.cache_url }}"
+          MODEL_IMAGE="${{ steps.setup.outputs.model_image }}"
+
+          if [ ! -s "${CACHE_PATH}/.cache-ready" ]; then
+            echo "::error::Local cache marker is missing at ${CACHE_PATH}/.cache-ready"
+            exit 1
+          fi
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u "${HTTP_USER}:${HTTP_PASS}" \
+            "${CACHE_URL}/.cache-ready" || true)
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::warning::Cache marker is not accessible over HTTP (HTTP $HTTP_STATUS); local marker is present"
+          fi
+
+          skopeo inspect --tls-verify=true "docker://${MODEL_IMAGE}" > /tmp/model-image.json
+          jq -r '.Digest' /tmp/model-image.json
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          CACHE_URL="${{ steps.setup.outputs.cache_url }}"
+          MODEL_IMAGE="${{ steps.setup.outputs.model_image }}"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "---" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Workflow:** download-hf-model" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Runner:** $(hostname)" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Cache marker:** ${CACHE_URL}/.cache-ready" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Model image:** \`${MODEL_IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"

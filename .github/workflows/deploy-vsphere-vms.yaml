@@ -1,0 +1,272 @@
+name: 'Deploy vSphere VMs'
+
+on:
+  workflow_dispatch:
+    inputs:
+      vm_set:
+        description: 'VM set from environments/example/vsphere-vms/<vm_set>.tfvars'
+        required: true
+        default: 'tenant-endpoint-test-vms'
+        type: string
+      action:
+        description: 'Deployment action'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - deploy
+          - destroy-plan
+          - destroy
+      confirm:
+        description: 'Required for deploy/destroy: set to the vm_set value'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: 'Validate vSphere VM inputs'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+
+    env:
+      TF_IN_AUTOMATION: true
+      TF_VAR_vsphere_password: ${{ secrets.VSPHERE_PASSWORD }}
+      TF_HTTP_ADDRESS: ${{ vars.UCS_TFSTATE_URL }}/state/example/vsphere-vms-${{ inputs.vm_set }}
+      TF_HTTP_LOCK_ADDRESS: ${{ vars.UCS_TFSTATE_URL }}/state/example/vsphere-vms-${{ inputs.vm_set }}
+      TF_HTTP_UNLOCK_ADDRESS: ${{ vars.UCS_TFSTATE_URL }}/state/example/vsphere-vms-${{ inputs.vm_set }}
+      TF_HTTP_USERNAME: basic
+      TF_HTTP_PASSWORD: ${{ secrets.HTTP_SERVER_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.vm_set }}" in
+            *[!A-Za-z0-9_-]*|'')
+              echo "::error::vm_set may only contain letters, numbers, underscore, and hyphen"
+              exit 1
+              ;;
+          esac
+          test -f "environments/example/vsphere-vms/${{ inputs.vm_set }}.tfvars"
+          if [[ "${{ inputs.action }}" == "deploy" || "${{ inputs.action }}" == "destroy" ]]; then
+            if [[ "${{ inputs.confirm }}" != "${{ inputs.vm_set }}" ]]; then
+              echo "::error::confirm must equal vm_set for deploy/destroy"
+              exit 1
+            fi
+          fi
+
+      - name: Terraform init
+        working-directory: tf/vsphere-vms
+        run: terraform init
+
+      - name: Terraform fmt check
+        working-directory: tf/vsphere-vms
+        run: terraform fmt -check
+
+      - name: Terraform validate
+        working-directory: tf/vsphere-vms
+        run: terraform validate
+
+      - name: Terraform plan
+        if: inputs.action == 'plan' || inputs.action == 'deploy'
+        working-directory: tf/vsphere-vms
+        run: terraform plan -var-file="../../environments/example/vsphere-vms/${{ inputs.vm_set }}.tfvars"
+
+      - name: Terraform destroy plan
+        if: inputs.action == 'destroy-plan' || inputs.action == 'destroy'
+        working-directory: tf/vsphere-vms
+        run: terraform plan -destroy -var-file="../../environments/example/vsphere-vms/${{ inputs.vm_set }}.tfvars"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## vSphere VM validation"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| VM set | ${{ inputs.vm_set }} |"
+            echo "| Action | ${{ inputs.action }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: 'Deploy vSphere VMs'
+    needs: validate
+    if: inputs.action == 'deploy' || inputs.action == 'destroy'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+
+    env:
+      TF_IN_AUTOMATION: true
+      TF_VAR_vsphere_password: ${{ secrets.VSPHERE_PASSWORD }}
+      TF_HTTP_ADDRESS: ${{ vars.UCS_TFSTATE_URL }}/state/example/vsphere-vms-${{ inputs.vm_set }}
+      TF_HTTP_LOCK_ADDRESS: ${{ vars.UCS_TFSTATE_URL }}/state/example/vsphere-vms-${{ inputs.vm_set }}
+      TF_HTTP_UNLOCK_ADDRESS: ${{ vars.UCS_TFSTATE_URL }}/state/example/vsphere-vms-${{ inputs.vm_set }}
+      TF_HTTP_USERNAME: basic
+      TF_HTTP_PASSWORD: ${{ secrets.HTTP_SERVER_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Terraform init
+        working-directory: tf/vsphere-vms
+        run: terraform init
+
+      - name: Terraform deploy
+        if: inputs.action == 'deploy'
+        working-directory: tf/vsphere-vms
+        run: terraform apply -auto-approve -var-file="../../environments/example/vsphere-vms/${{ inputs.vm_set }}.tfvars"
+
+      - name: Terraform destroy
+        if: inputs.action == 'destroy'
+        working-directory: tf/vsphere-vms
+        run: terraform destroy -auto-approve -var-file="../../environments/example/vsphere-vms/${{ inputs.vm_set }}.tfvars"
+
+      - name: Capture VM outputs
+        if: inputs.action == 'deploy'
+        working-directory: tf/vsphere-vms
+        run: |
+          terraform output -json vm_access > /tmp/vm-access.json
+          cat /tmp/vm-access.json
+
+      - name: Upload VM access output
+        if: inputs.action == 'deploy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-access-${{ inputs.vm_set }}
+          path: /tmp/vm-access.json
+          retention-days: 1
+
+  test:
+    name: 'Test deployed vSphere VMs'
+    needs:
+      - validate
+      - deploy
+    if: always() && inputs.action == 'deploy' && needs.deploy.result == 'success'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download VM access output
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-access-${{ inputs.vm_set }}
+          path: /tmp
+
+      - name: Check for Ansible post-config
+        id: postconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          config="environments/example/vsphere-vms/${{ inputs.vm_set }}.postconfig.json"
+          if [ -f "$config" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "config=$config" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate Ansible inventory
+        if: steps.postconfig.outputs.enabled == 'true'
+        shell: bash
+        env:
+          POSTCONFIG_FILE: ${{ steps.postconfig.outputs.config }}
+        run: |
+          python3 -c 'import json, os
+          from pathlib import Path
+          outputs = json.loads(Path("/tmp/vm-access.json").read_text())
+          postconfig = json.loads(Path(os.environ["POSTCONFIG_FILE"]).read_text())
+          group = postconfig.get("inventory_group", "vsphere_vms")
+          ssh_user = postconfig.get("ssh_user", "ubuntu")
+          key_file = postconfig.get("ssh_private_key_file", "~/.ssh/id_rsa")
+          inventory = {
+              "all": {
+                  "children": {
+                      group: {
+                          "hosts": {name: {"ansible_host": vm["ip"]} for name, vm in sorted(outputs.items())},
+                          "vars": {
+                              "ansible_user": ssh_user,
+                              "ansible_ssh_private_key_file": key_file,
+                          },
+                      }
+                  }
+              }
+          }
+          Path("/tmp/vsphere-vms.json").write_text(json.dumps(inventory))'
+
+      - name: Configure SSH for Ansible
+        if: steps.postconfig.outputs.enabled == 'true'
+        shell: bash
+        env:
+          JUMP_HOST_SSH_KEY: ${{ secrets.JUMP_HOST_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JUMP_HOST_SSH_KEY:-}" ]; then
+            echo "::error::JUMP_HOST_SSH_KEY secret not configured"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$JUMP_HOST_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 700 ~/.ssh
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Run Ansible post-config and validation
+        if: steps.postconfig.outputs.enabled == 'true'
+        shell: bash
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: 'false'
+          POSTCONFIG_FILE: ${{ steps.postconfig.outputs.config }}
+        run: |
+          set -euo pipefail
+          playbook=$(python3 -c 'import json, os
+          from pathlib import Path
+          data = json.loads(Path(os.environ["POSTCONFIG_FILE"]).read_text())
+          print(data["playbook"])')
+          ansible-playbook -i /tmp/vsphere-vms.json "$playbook" -e env=example
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## vSphere VM deploy/test"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| VM set | ${{ inputs.vm_set }} |"
+            echo "| Action | ${{ inputs.action }} |"
+            echo "| Post-config | ${{ steps.postconfig.outputs.enabled || 'not checked' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  retain-on-failure:
+    name: Retain failed VM set for explicit recovery
+    needs: [deploy, test]
+    if: always() && inputs.action == 'deploy' && needs.deploy.result == 'success' && needs.test.result == 'failure'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    steps:
+      - name: Record recovery boundary
+        shell: bash
+        env:
+          VM_SET: ${{ inputs.vm_set }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## vSphere validation failed"
+            echo "VM set $VM_SET and Terraform state were retained."
+            echo "Inspect the failed test and ownership before an explicit recovery/destroy dispatch."
+          } >> "$GITHUB_STEP_SUMMARY"

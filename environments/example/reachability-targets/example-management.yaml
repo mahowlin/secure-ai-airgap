@@ -1,0 +1,30 @@
+sources:
+  tenant-a-endpoint:
+    host: 198.18.12.66
+    ssh_user: ubuntu
+  tenant-b-endpoint:
+    host: 198.18.14.66
+    ssh_user: ubuntu
+
+targets:
+  - name: tenant-a-hosted-api
+    description: Tenant-A hosted KubeAPI VIP
+    source: tenant-a-endpoint
+    host: 198.18.11.17
+    port: 6443
+    https_path: /version
+  - name: tenant-b-hosted-api
+    description: Tenant-B/shared hosted KubeAPI VIP
+    source: tenant-b-endpoint
+    host: 198.18.13.18
+    port: 6443
+    https_path: /version
+
+# Add hosted tenant app VIP/FQDN checks here as applications are exposed.
+# Example:
+# - name: tenant-a-sample-app
+#   description: Tenant-A sample application HTTPS route
+#   source: tenant-a-endpoint
+#   host: app.example.example.com
+#   port: 443
+#   https_path: /

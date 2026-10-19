@@ -1,7 +1,3 @@
-# Copyright (c) 2026 Cisco and/or its affiliates.
-# Licensed under the Cisco Sample Code License, Version 1.1
-# See LICENSE in the project root.
-
 name: Manage Cluster Users
 
 on:
@@ -10,12 +6,7 @@ on:
       cluster_name:
         description: 'Target cluster'
         required: true
-        type: choice
-        options:
-          - ai-pod-1
-          - ai-pod-2
-          - ai-pod-3
-          - ai-pod-4
+        type: string
       users:
         description: 'Comma-separated usernames (e.g., mahowlin,jdoe)'
         required: true
@@ -62,9 +53,9 @@ env:
 jobs:
   manage-users:
     name: ${{ inputs.action }} users on ${{ inputs.cluster_name }}
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     defaults:
       run:
@@ -74,6 +65,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate requested account identities
+        if: inputs.action == 'create' || inputs.action == 'delete'
+        shell: bash
+        env:
+          REQUESTED_USERS: ${{ inputs.users }}
+        run: |
+          set -euo pipefail
+          python3 scripts/remove-managed-user-access.py --validate-users "$REQUESTED_USERS"
+
+      - name: Prepare private jump host SSH access
+        if: inputs.action == 'create' || inputs.action == 'delete'
+        shell: bash
+        env:
+          JUMP_HOST_SSH_KEY: ${{ secrets.JUMP_HOST_SSH_KEY }}
+          JUMP_HOST_KNOWN_HOSTS: ${{ secrets.JUMP_HOST_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [ -n "${JUMP_HOST_SSH_KEY:-}" ] || exit 0
+          [ -n "${JUMP_HOST_KNOWN_HOSTS:-}" ] || { echo "::error::JUMP_HOST_KNOWN_HOSTS is required"; exit 1; }
+          key_dir=$(mktemp -d "$RUNNER_TEMP/managed-user-ssh.XXXXXX")
+          trap 'rm -rf -- "$key_dir"' ERR
+          printf '%s\n' "$JUMP_HOST_SSH_KEY" > "$key_dir/key"
+          printf '%s\n' "$JUMP_HOST_KNOWN_HOSTS" > "$key_dir/known_hosts"
+          chmod 600 "$key_dir/key" "$key_dir/known_hosts"
+          ssh-keygen -l -f "$key_dir/known_hosts" >/dev/null
+          echo "JUMP_SSH_DIR=$key_dir" >> "$GITHUB_ENV"
+
       - name: Get Kubeconfig
         env:
           KUBECONFIG_REPO_TOKEN: ${{ secrets.KUBECONFIG_REPO_TOKEN }}
@@ -82,9 +100,13 @@ jobs:
 
           echo "Fetching kubeconfig for $CLUSTER_NAME..."
 
+          KUBECONFIG_REPOSITORY="${{ vars.KUBECONFIG_REPOSITORY }}"
+          [[ "$KUBECONFIG_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || exit 1
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$KUBECONFIG_REPO_TOKEN" | base64 | tr -d '\n')"
           git clone --depth 1 \
-            # Configure this URL for your kubeconfig storage repository
-            "https://x-access-token:${KUBECONFIG_REPO_TOKEN}@github.com/mahowlin/saif-kubeconfigs.git" \
+            "https://github.com/${KUBECONFIG_REPOSITORY}.git" \
             /tmp/kubeconfigs
 
           KUBECONFIG_FILE="/tmp/kubeconfigs/clusters/${CLUSTER_NAME}/kubeconfig"
@@ -234,7 +256,7 @@ jobs:
 
               # Prepare WebEx message (Markdown format - concise)
               MESSAGE=$(cat <<WEBEX_EOF
-          **🐻 SAIF AI Pod - ${CLUSTER_NAME}**
+          **Cluster - ${CLUSTER_NAME}**
 
           **Cluster:** \`${CLUSTER_NAME}\` | **User:** \`${user}\` | **Role:** \`${{ inputs.role }}\`
           **Password:** \`${PASSWORD}\`
@@ -263,7 +285,7 @@ jobs:
           oc whoami && oc get nodes
           \`\`\`
 
-          📖 [Docs](https://github.com/mahowlin/saif-ai-pod)
+          📖 [Docs](https://github.com/mahowlin/secure-ai-compute) | 🔑 [Kubeconfigs](https://github.com/mahowlin/saif-kubeconfigs)
           WEBEX_EOF
           )
 
@@ -360,11 +382,8 @@ jobs:
           IFS=',' read -ra PUBKEYS <<< "${{ inputs.ssh_pubkeys }}"
 
           # Setup SSH key for jump host access
-          mkdir -p ~/.ssh
-          echo "$JUMP_HOST_SSH_KEY" > ~/.ssh/jump_host_key
-          chmod 600 ~/.ssh/jump_host_key
 
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/jump_host_key"
+          SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$JUMP_SSH_DIR/known_hosts" -i "$JUMP_SSH_DIR/key")
 
           echo "| Username | Jump Host Status |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|------------------|" >> $GITHUB_STEP_SUMMARY
@@ -387,25 +406,28 @@ jobs:
             echo "Creating jump host user: $user"
 
             # Create user on jump host via SSH
-            ssh $SSH_OPTS ${JUMP_HOST_USER}@${JUMP_HOST} "
-              sudo useradd -m -s /bin/bash '$user' 2>/dev/null || true
-              sudo mkdir -p /home/'$user'/.ssh
-              echo '$pubkey' | sudo tee /home/'$user'/.ssh/authorized_keys > /dev/null
-              sudo chown -R '$user':'$user' /home/'$user'/.ssh
-              sudo chmod 700 /home/'$user'/.ssh
-              sudo chmod 600 /home/'$user'/.ssh/authorized_keys
+            [[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "::error::invalid Linux account identity"; exit 1; }
+            printf '%s\n' "$pubkey" | ssh "${SSH_OPTS[@]}" "${JUMP_HOST_USER}@${JUMP_HOST}" "
+              if getent passwd '$user' >/dev/null; then
+                getent passwd '$user' | cut -d: -f5 | grep -Fxq 'managed-by=manage-cluster-users-workflow' || exit 1
+              else
+                sudo -n useradd -m -s /bin/bash -c 'managed-by=manage-cluster-users-workflow' '$user'
+              fi
+              sudo -n mkdir -p /home/'$user'/.ssh
+              sudo -n tee /home/'$user'/.ssh/authorized_keys > /dev/null
+              sudo -n chown -R '$user':'$user' /home/'$user'/.ssh
+              sudo -n chmod 700 /home/'$user'/.ssh
+              sudo -n chmod 600 /home/'$user'/.ssh/authorized_keys
             "
 
             echo "| $user | Created |" >> $GITHUB_STEP_SUMMARY
           done
 
-          # Cleanup
-          rm -f ~/.ssh/jump_host_key
 
       - name: Delete Users
         if: inputs.action == 'delete'
         run: |
-          set -e
+          set -euo pipefail
 
           IFS=',' read -ra USERS <<< "${{ inputs.users }}"
 
@@ -414,13 +436,19 @@ jobs:
           echo "**Cluster:** $CLUSTER_NAME" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Get existing htpasswd file
-          HTPASSWD_FILE="/tmp/htpasswd"
-          if oc get secret $HTPASSWD_SECRET -n openshift-config &>/dev/null; then
-            oc get secret $HTPASSWD_SECRET -n openshift-config -o jsonpath='{.data.htpasswd}' | base64 -d > $HTPASSWD_FILE
-          else
-            echo "No HTPasswd secret found - nothing to delete"
-            exit 0
+          # A failed read is not absence. Save one successful, private observation
+          # and validate/decode it before any owned binding mutation.
+          HTPASSWD_FILE=$(mktemp "$RUNNER_TEMP/managed-htpasswd.XXXXXX")
+          SECRET_OBSERVATION=""
+          trap 'rm -f -- "$HTPASSWD_FILE" "$SECRET_OBSERVATION"' EXIT
+          SECRET_OBSERVATION=$(mktemp "$RUNNER_TEMP/managed-secret.XXXXXX")
+          oc get secret "$HTPASSWD_SECRET" -n openshift-config \
+            --ignore-not-found -o json > "$SECRET_OBSERVATION"
+          secret_present=$(python3 scripts/remove-managed-user-access.py \
+            --decode-secret "$SECRET_OBSERVATION" --htpasswd-file "$HTPASSWD_FILE" \
+            --secret-name "$HTPASSWD_SECRET" --namespace openshift-config)
+          if [ "$secret_present" = false ]; then
+            echo "No HTPasswd secret; continuing owned access revocation"
           fi
 
           echo "| Username | Status |" >> $GITHUB_STEP_SUMMARY
@@ -430,36 +458,21 @@ jobs:
             user=$(echo "$user" | xargs)
             [[ -z "$user" ]] && continue
 
-            # Remove from htpasswd file
-            if grep -q "^${user}:" $HTPASSWD_FILE; then
-              grep -v "^${user}:" $HTPASSWD_FILE > /tmp/htpasswd.tmp || true
-              mv /tmp/htpasswd.tmp $HTPASSWD_FILE
-              echo "Removed $user from htpasswd"
-            fi
+            # Revoke only exact User subjects in workflow-owned bindings.
+            # User/Identity objects can be shared with other IDPs; do not delete them.
+            python3 scripts/remove-managed-user-access.py \
+              --user "$user" --htpasswd-file "$HTPASSWD_FILE"
 
-            # Delete ClusterRoleBindings for this user
-            BINDINGS=$(oc get clusterrolebindings -o json | \
-              jq -r ".items[] | select(.subjects[]?.name == \"$user\") | .metadata.name" | sort -u)
-
-            for binding in $BINDINGS; do
-              oc delete clusterrolebinding "$binding" 2>/dev/null || true
-              echo "Deleted ClusterRoleBinding: $binding"
-            done
-
-            # Delete identity if exists
-            oc delete identity "${HTPASSWD_IDP_NAME}:${user}" 2>/dev/null || true
-
-            # Delete user object if exists
-            oc delete user "$user" 2>/dev/null || true
-
-            echo "| $user | Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| $user | Managed access revoked |" >> $GITHUB_STEP_SUMMARY
           done
 
           # Update the htpasswd secret
-          oc create secret generic $HTPASSWD_SECRET \
+          if [ "$secret_present" = true ]; then
+            oc create secret generic "$HTPASSWD_SECRET" \
             --from-file=htpasswd=$HTPASSWD_FILE \
             -n openshift-config \
             --dry-run=client -o yaml | oc apply -f -
+          fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Users removed successfully." >> $GITHUB_STEP_SUMMARY
@@ -483,11 +496,8 @@ jobs:
           IFS=',' read -ra USERS <<< "${{ inputs.users }}"
 
           # Setup SSH key for jump host access
-          mkdir -p ~/.ssh
-          echo "$JUMP_HOST_SSH_KEY" > ~/.ssh/jump_host_key
-          chmod 600 ~/.ssh/jump_host_key
 
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/jump_host_key"
+          SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$JUMP_SSH_DIR/known_hosts" -i "$JUMP_SSH_DIR/key")
 
           echo "| Username | Jump Host Status |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|------------------|" >> $GITHUB_STEP_SUMMARY
@@ -499,15 +509,17 @@ jobs:
             echo "Deleting jump host user: $user"
 
             # Delete user on jump host via SSH
-            ssh $SSH_OPTS ${JUMP_HOST_USER}@${JUMP_HOST} "
-              sudo userdel -r '$user' 2>/dev/null || true
+            [[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "::error::invalid Linux account identity"; exit 1; }
+            ssh "${SSH_OPTS[@]}" "${JUMP_HOST_USER}@${JUMP_HOST}" "
+              if getent passwd '$user' >/dev/null; then
+                getent passwd '$user' | cut -d: -f5 | grep -Fxq 'managed-by=manage-cluster-users-workflow' || exit 1
+                sudo -n userdel -r '$user'
+              fi
             "
 
             echo "| $user | Deleted |" >> $GITHUB_STEP_SUMMARY
           done
 
-          # Cleanup
-          rm -f ~/.ssh/jump_host_key
 
       - name: Final Status
         run: |
@@ -524,3 +536,12 @@ jobs:
           echo "=== Workflow-Managed ClusterRoleBindings ==="
           oc get clusterrolebindings -l managed-by=manage-cluster-users-workflow -o wide 2>/dev/null || \
             echo "No workflow-managed bindings found"
+
+      - name: Remove private temporary SSH access
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${JUMP_SSH_DIR:-}" ]; then
+            rm -rf -- "$JUMP_SSH_DIR"
+          fi

@@ -1,10 +1,6 @@
-# Copyright (c) 2026 Cisco and/or its affiliates.
-# Licensed under the Cisco Sample Code License, Version 1.1
-# See LICENSE in the project root.
-
-# Build Demo Application Images for amd64
-# This workflow builds and pushes demo microservice images to the internal registry.
-name: Build Demo App Images
+# Build Cisco Boutique Demo Images for amd64
+# Source: https://github.com/nvibert/cisco-microservices-demo
+name: Build Cisco Boutique Images
 
 on:
   workflow_dispatch:
@@ -20,11 +16,11 @@ on:
 
 env:
   REGISTRY: registry.example.com:5000
-  IMAGE_PREFIX: demo-app
+  IMAGE_PREFIX: cisco-boutique
 
 jobs:
   build:
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     strategy:
       fail-fast: false
       matrix:
@@ -53,7 +49,7 @@ jobs:
             context: src/loadgenerator
 
     steps:
-      - name: Checkout demo app source
+      - name: Checkout cisco-microservices-demo
         uses: actions/checkout@v4
         with:
           repository: nvibert/cisco-microservices-demo
@@ -75,17 +71,19 @@ jobs:
           push: ${{ !inputs.dry_run }}
           platforms: linux/amd64
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ inputs.image_tag }}
+          # Use host network to allow build containers to reach external repos
           network: host
+          # Disable GHA cache (not available on the selected runners without config)
           no-cache: true
 
   summary:
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     needs: build
     if: always()
     steps:
       - name: Build Summary
         run: |
-          echo "## Demo App Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## Cisco Boutique Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Tag:** ${{ inputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
           echo "**Registry:** ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,334 @@
+name: Publish official CLIFE installer package
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: CLIFE package release
+        required: true
+        default: '1.19.5'
+        type: choice
+        options: ['1.19.5', '1.19.7']
+      contract_revision:
+        description: Full merged Datacenter commit represented by the promoted package input
+        required: true
+        type: string
+      adopt_existing:
+        description: Verify and adopt an already-published byte-identical package after an interrupted receipt step
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+env:
+  CONTRACT_REPOSITORY: mahowlin/secure-ai-datacenter
+  CONTRACT_PATH: data/package-contracts/clife-install-${{ inputs.package_version }}.yaml
+  PROMOTED_INPUT: mirror/package-inputs/clife-install/${{ inputs.package_version }}
+  RELEASE_CONTRACT: ${{ inputs.package_version == '1.19.7' && 'mirror/releases/clife-1.19.7.yaml' || 'mirror/releases/iep-26.05.yaml' }}
+  CRANE_VERSION: 0.22.0
+  CRANE_LINUX_X86_64_SHA256: edb74d53fad9a596860f59d1c5d04a43dfb5f441dc71f57060dd0bf39483c833
+  LOCAL_REGISTRY: registry.example.com:5000
+
+jobs:
+  validate-executor-lineage:
+    name: Require exact main executor
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      revision: ${{ steps.lineage.outputs.revision }}
+    steps:
+      - name: Checkout requested executor revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Require exact protected main head
+        id: lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ github.ref }}" = "refs/heads/main" || {
+            echo "::error::publication workflow must be dispatched from main"
+            exit 2
+          }
+          git fetch origin main
+          executor_revision=$(git rev-parse HEAD)
+          main_revision=$(git rev-parse origin/main)
+          test "$executor_revision" = "${{ github.sha }}"
+          test "$executor_revision" = "$main_revision" || {
+            echo "::error::executor is not the exact current reviewed main head"
+            exit 2
+          }
+          echo "revision=$executor_revision" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Verify, package, publish, and receipt
+    needs: validate-executor-lineage
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    steps:
+      - name: Validate immutable contract input
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${{ inputs.contract_revision }}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::contract_revision must be a full Git commit hash"
+            exit 2
+          fi
+
+      - name: Checkout sys-admin executor
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate-executor-lineage.outputs.revision }}
+          fetch-depth: 0
+
+      - name: Recheck exact executor
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ needs.validate-executor-lineage.outputs.revision }}"
+
+      - name: Install pinned package input tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --target "$RUNNER_TEMP/clife-package-python" \
+            PyYAML==6.0.3 \
+            jsonschema==4.26.0
+          echo "PYTHONPATH=$RUNNER_TEMP/clife-package-python" >> "$GITHUB_ENV"
+
+      - name: Install pinned crane
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
+          bin_dir="$RUNNER_TEMP/clife-package-bin"
+          curl --fail --location --silent --show-error \
+            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            --output "$archive"
+          echo "${CRANE_LINUX_X86_64_SHA256}  $archive" | sha256sum --check --strict
+          mkdir -p "$bin_dir"
+          tar -xzf "$archive" -C "$bin_dir" crane
+          test "$("$bin_dir/crane" version)" = "$CRANE_VERSION"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
+      - name: Verify promoted SAIF package input
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-clife-package-input.py \
+            --bundle "$PROMOTED_INPUT" \
+            --repository "$CONTRACT_REPOSITORY" \
+            --revision "${{ inputs.contract_revision }}" \
+            --contract-path "$CONTRACT_PATH"
+          python3 "$PROMOTED_INPUT/validate-contract.py" \
+            "$PROMOTED_INPUT/contract.yaml" \
+            --schema "$PROMOTED_INPUT/contract.schema.json"
+
+      - name: Download and verify official release into runner temporary storage
+        env:
+          ISOVALENT_REGISTRY_USERNAME: ${{ vars.ISOVALENT_REGISTRY_USERNAME }}
+          ISOVALENT_REGISTRY_TOKEN: ${{ secrets.ISOVALENT_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          inspection_args=()
+          if [ "${{ inputs.package_version }}" = "1.19.7" ]; then
+            inspection_args+=(--package-only)
+          fi
+          python3 scripts/inspect-isovalent-release.py \
+            --contract "$RELEASE_CONTRACT" \
+            --output "$RUNNER_TEMP/clife-release-evidence.json" \
+            --bundle-output "$RUNNER_TEMP/clife-v${{ inputs.package_version }}.tar.gz" \
+            "${inspection_args[@]}"
+
+      - name: Prepare isolated authenticated registry access
+        env:
+          REDHAT_PULL_SECRET: ${{ secrets.REDHAT_PULL_SECRET }}
+          ISOVALENT_REGISTRY_USERNAME: ${{ vars.ISOVALENT_REGISTRY_USERNAME }}
+          ISOVALENT_REGISTRY_TOKEN: ${{ secrets.ISOVALENT_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null
+          python3 scripts/prepare-isovalent-auth.py \
+            --selection mirror/isovalent-selection.yaml --output-root "$RUNNER_TEMP" \
+            --expected-registry "$LOCAL_REGISTRY" --github-env "$GITHUB_ENV"
+
+      - name: Verify complete internal runtime image closure
+        run: >-
+          python3 scripts/verify-isovalent-mirror.py
+          --contract "$RELEASE_CONTRACT"
+          --registry "https://${LOCAL_REGISTRY}"
+          --auth-file "$REGISTRY_AUTH_FILE"
+          --cert-dir "$ISOVALENT_CERT_DIR"
+
+      - name: Inspect official embedded Cilium chart
+        id: embedded
+        shell: bash
+        run: |
+          set -euo pipefail
+          readarray -t controller < <(python3 - <<'PY'
+          import os
+          import yaml
+          contract = yaml.safe_load(open(os.path.join(os.environ['PROMOTED_INPUT'], 'contract.yaml')))
+          image = next(item for item in contract['spec']['runtimeImages'] if item['name'] == 'clife')
+          print(image['mirror'])
+          print(image['digest'])
+          PY
+          )
+          crane export "${controller[0]}@${controller[1]}" "$RUNNER_TEMP/clife-rootfs.tar"
+
+      - name: Build twice and prove deterministic package bytes
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          for build_name in build-a build-b; do
+            python3 scripts/package-clife-chart.py build \
+              --contract "$PROMOTED_INPUT/contract.yaml" \
+              --release-contract "$RELEASE_CONTRACT" \
+              --release-contract-path "$RELEASE_CONTRACT" \
+              --contract-path "$CONTRACT_PATH" \
+              --contract-repository "$CONTRACT_REPOSITORY" \
+              --contract-revision "${{ inputs.contract_revision }}" \
+              --executor-repository "${{ github.repository }}" \
+              --executor-revision "${{ needs.validate-executor-lineage.outputs.revision }}" \
+              --archive "$RUNNER_TEMP/clife-v${{ inputs.package_version }}.tar.gz" \
+              --embedded-rootfs "$RUNNER_TEMP/clife-rootfs.tar" \
+              --output-dir "$RUNNER_TEMP/$build_name" \
+              >"$RUNNER_TEMP/$build_name.json"
+          done
+          chart_a=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["chart"])' "$RUNNER_TEMP/build-a.json")
+          chart_b=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["chart"])' "$RUNNER_TEMP/build-b.json")
+          cmp "$chart_a" "$chart_b"
+          cmp "$RUNNER_TEMP/build-a/receipt-draft.yaml" "$RUNNER_TEMP/build-b/receipt-draft.yaml"
+          version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$RUNNER_TEMP/build-a.json")
+          echo "chart=$chart_a" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Lint and render all contract-derived package targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in management tenant-a shared-ab; do
+            helm lint "$RUNNER_TEMP/build-a/clife-install" \
+              -f "$RUNNER_TEMP/build-a/${target}-values.yaml"
+            helm template "clife-${target}" "$RUNNER_TEMP/build-a/clife-install" \
+              -f "$RUNNER_TEMP/build-a/${target}-values.yaml" \
+              >"$RUNNER_TEMP/${target}-render.yaml"
+          done
+          if grep -qx 'kind: Network' "$RUNNER_TEMP/management-render.yaml"; then
+            echo "::error::management mode rendered hosted Network intent"
+            exit 2
+          fi
+          for target in tenant-a shared-ab; do
+            grep -qx 'kind: Network' "$RUNNER_TEMP/${target}-render.yaml"
+            grep -q 'deployKubeProxy: false' "$RUNNER_TEMP/${target}-render.yaml"
+            grep -q 'kubeProxyReplacement: true' "$RUNNER_TEMP/${target}-render.yaml"
+            grep -q "name: ${target}" "$RUNNER_TEMP/${target}-render.yaml"
+          done
+
+      - name: Publish immutable chart or adopt an exact interrupted publication
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          chart_repository="${LOCAL_REGISTRY}/charts/clife-install"
+          chart_reference="${chart_repository}:${{ steps.build.outputs.version }}"
+          set +e
+          crane digest "$chart_reference" \
+            >"$RUNNER_TEMP/registry-lookup.stdout" \
+            2>"$RUNNER_TEMP/registry-lookup.stderr"
+          lookup_exit=$?
+          set -e
+          if [ "$lookup_exit" -eq 0 ]; then
+            lookup_result="$RUNNER_TEMP/registry-lookup.stdout"
+          else
+            lookup_result="$RUNNER_TEMP/registry-lookup.stderr"
+          fi
+          lookup_state=$(python3 scripts/package-clife-chart.py classify-registry-lookup \
+            --exit-code "$lookup_exit" \
+            --result "$lookup_result")
+          if [ "$lookup_state" = "present" ]; then
+            if [ "${{ inputs.adopt_existing }}" != "true" ]; then
+              echo "::error::immutable chart tag already exists; use adopt_existing only for an interrupted receipt run"
+              exit 2
+            fi
+            existing_digest=$(tr -d '\n' <"$RUNNER_TEMP/registry-lookup.stdout")
+          else
+            helm push "${{ steps.build.outputs.chart }}" "oci://${LOCAL_REGISTRY}/charts" \
+              --ca-file "$ISOVALENT_CERT_DIR/ca.crt"
+          fi
+
+          verified="$RUNNER_TEMP/verified-publication"
+          mkdir -p "$verified"
+          helm pull "oci://${chart_repository}" \
+            --version "${{ steps.build.outputs.version }}" \
+            --destination "$verified" \
+            --ca-file "$ISOVALENT_CERT_DIR/ca.crt"
+          cmp \
+            "${{ steps.build.outputs.chart }}" \
+            "$verified/$(basename "${{ steps.build.outputs.chart }}")"
+          oci_digest=$(crane digest "$chart_reference")
+          [[ "$oci_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [ "$lookup_state" = "present" ]; then
+            test "$oci_digest" = "$existing_digest" || {
+              echo "::error::immutable chart digest changed during adoption"
+              exit 2
+            }
+          fi
+          echo "oci_digest=$oci_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Finalize receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          receipt_dir="mirror/packages/clife-install/${{ steps.build.outputs.version }}"
+          python3 scripts/package-clife-chart.py finalize \
+            --draft "$RUNNER_TEMP/build-a/receipt-draft.yaml" \
+            --oci-digest "${{ steps.publish.outputs.oci_digest }}" \
+            --workflow-run-id "${{ github.run_id }}" \
+            --output "$receipt_dir/receipt.yaml"
+
+      - name: Open receipt-only pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: automation/clife-install-${{ steps.build.outputs.version }}-${{ github.run_id }}
+          base: main
+          commit-message: "chore: record CLIFE package receipt"
+          title: "chore: record CLIFE ${{ steps.build.outputs.version }} package receipt"
+          body: |
+            Records the immutable publication receipt for the official CLIFE installer package.
+
+            Source contract: `${{ env.CONTRACT_REPOSITORY }}@${{ inputs.contract_revision }}`
+            OCI digest: `${{ steps.publish.outputs.oci_digest }}`
+            Workflow: `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
+          add-paths: |
+            mirror/packages/clife-install/${{ steps.build.outputs.version }}/receipt.yaml
+            mirror/packages/clife-install/${{ steps.build.outputs.version }}/receipt.sha256
+          labels: |
+            release
+            clife
+
+      - name: Remove temporary registry credentials and trust configuration
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${ISOVALENT_AUTH_DIR:-}" ]; then
+            rm -rf -- "$ISOVALENT_AUTH_DIR"
+          fi

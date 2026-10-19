@@ -1,0 +1,25 @@
+# Additional mirror-policy source prefixes that cannot be reliably derived from
+# ImageSetConfiguration input alone. Keep workflow/Python logic generic; add new
+# source prefixes here when OLM-resolved bundles pull from repository prefixes
+# that are not explicitly listed in mirror/*.yaml.
+mirrors:
+  quay.io/openshift-release-dev/ocp-release: openshift/release-images
+  quay.io/openshift-release-dev/ocp-v4.0-art-dev: openshift/release
+configs:
+  mirror/platform-images.yaml:
+    sources:
+      - quay.io/openshift-release-dev/ocp-release
+      - quay.io/openshift-release-dev/ocp-v4.0-art-dev
+  mirror/redhat-operators.yaml:
+    sources:
+      - registry.redhat.io/openshift4
+      - registry.redhat.io/openshift-gitops-1
+      - registry.redhat.io/rhel9
+      - registry.redhat.io/container-native-virtualization
+      - registry.redhat.io/lvms4
+      - registry.redhat.io/multicluster-engine
+      - registry.redhat.io/rhacm2
+  mirror/other-images.yaml:
+    sources:
+      - registry.connect.redhat.com/nvidia
+      - registry.redhat.io/openshift4

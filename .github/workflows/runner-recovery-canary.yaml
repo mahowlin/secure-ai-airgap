@@ -1,0 +1,23 @@
+name: 'Runner Recovery Canary'
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: 'Bounded runner connectivity check'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    timeout-minutes: 5
+    steps:
+      - name: Verify runner and Docker connectivity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = "Linux"
+          docker version --format 'client={{.Client.Version}} server={{.Server.Version}}'
+          curl --fail --silent --show-error --max-time 10 \
+            https://api.github.com/meta >/dev/null
+          printf 'runner recovery canary passed\n'

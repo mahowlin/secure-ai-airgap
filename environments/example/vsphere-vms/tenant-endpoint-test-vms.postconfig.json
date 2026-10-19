@@ -1,0 +1,6 @@
+{
+  "inventory_group": "endpoint_test_vms",
+  "ssh_user": "ubuntu",
+  "ssh_private_key_file": "~/.ssh/id_rsa",
+  "playbook": "ansible/playbooks/configure-test-endpoints.yaml"
+}
